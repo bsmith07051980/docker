@@ -97,7 +97,7 @@ RUN cd /usr/local/lvm2 \
 
 ## BUILD GOLANG 1.7 with existing gccgo
 
-ENV GO_VERSION 1.7
+ENV GO_VERSION 1.7.1
 ENV GO_DOWNLOAD_URL https://golang.org/dl/go${GO_VERSION}.src.tar.gz
 ENV GOROOT_BOOTSTRAP /usr/local
 
@@ -183,15 +183,6 @@ RUN ./contrib/download-frozen-image-v2.sh /docker-frozen-images \
 	s390x/debian:jessie@sha256:b74c863400909eff3c5e196cac9bfd1f6333ce47aae6a38398d87d5875da170a \
 	s390x/hello-world:latest@sha256:780d80b3a7677c3788c0d5cd9168281320c8d4a6d9183892d8ee5cdd610f5699
 # see also "hack/make/.ensure-frozen-images" (which needs to be updated any time this list is)
-
-# Download man page generator
-RUN set -x \
-	&& export GOPATH="$(mktemp -d)" \
-	&& git clone --depth 1 -b v1.0.5 https://github.com/cpuguy83/go-md2man.git "$GOPATH/src/github.com/cpuguy83/go-md2man" \
-	&& git clone --depth 1 -b v1.4 https://github.com/russross/blackfriday.git "$GOPATH/src/github.com/russross/blackfriday" \
-	&& go get -v -d github.com/cpuguy83/go-md2man \
-	&& go build -v -o /usr/local/bin/go-md2man github.com/cpuguy83/go-md2man \
-	&& rm -rf "$GOPATH"
 
 # Download toml validator
 ENV TOMLV_COMMIT 9baf8a8a9f2ed20a8e54160840c492f937eeaf9a

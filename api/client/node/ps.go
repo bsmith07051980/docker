@@ -1,15 +1,14 @@
 package node
 
 import (
-	"golang.org/x/net/context"
-
 	"github.com/docker/docker/api/client"
 	"github.com/docker/docker/api/client/idresolver"
 	"github.com/docker/docker/api/client/task"
+	"github.com/docker/docker/api/types"
 	"github.com/docker/docker/cli"
 	"github.com/docker/docker/opts"
-	"github.com/docker/engine-api/types"
 	"github.com/spf13/cobra"
+	"golang.org/x/net/context"
 )
 
 type psOptions struct {
@@ -48,7 +47,7 @@ func runPs(dockerCli *client.DockerCli, opts psOptions) error {
 	client := dockerCli.Client()
 	ctx := context.Background()
 
-	nodeRef, err := Reference(client, ctx, opts.nodeID)
+	nodeRef, err := Reference(ctx, client, opts.nodeID)
 	if err != nil {
 		return nil
 	}

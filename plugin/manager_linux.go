@@ -9,12 +9,12 @@ import (
 	"time"
 
 	"github.com/Sirupsen/logrus"
+	"github.com/docker/docker/api/types/container"
 	"github.com/docker/docker/libcontainerd"
 	"github.com/docker/docker/oci"
 	"github.com/docker/docker/pkg/plugins"
 	"github.com/docker/docker/plugin/v2"
 	"github.com/docker/docker/restartmanager"
-	"github.com/docker/engine-api/types/container"
 )
 
 func (pm *Manager) enable(p *v2.Plugin, force bool) error {
@@ -43,11 +43,7 @@ func (pm *Manager) enable(p *v2.Plugin, force bool) error {
 	}
 
 	pm.pluginStore.SetState(p, true)
-	for _, typ := range p.GetTypes() {
-		if handler := pm.handlers[typ.String()]; handler != nil {
-			handler(p.Name(), p.Client())
-		}
-	}
+	pm.pluginStore.CallHandler(p)
 
 	return nil
 }

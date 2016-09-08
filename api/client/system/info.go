@@ -8,12 +8,12 @@ import (
 	"golang.org/x/net/context"
 
 	"github.com/docker/docker/api/client"
+	"github.com/docker/docker/api/types"
+	"github.com/docker/docker/api/types/swarm"
 	"github.com/docker/docker/cli"
 	"github.com/docker/docker/pkg/ioutils"
 	"github.com/docker/docker/utils"
 	"github.com/docker/docker/utils/templates"
-	"github.com/docker/engine-api/types"
-	"github.com/docker/engine-api/types/swarm"
 	"github.com/docker/go-units"
 	"github.com/spf13/cobra"
 )
@@ -234,6 +234,13 @@ func prettyPrintInfo(dockerCli *client.DockerCli, info types.Info) error {
 		for _, registry := range info.RegistryConfig.InsecureRegistryCIDRs {
 			mask, _ := registry.Mask.Size()
 			fmt.Fprintf(dockerCli.Out(), " %s/%d\n", registry.IP.String(), mask)
+		}
+	}
+
+	if info.RegistryConfig != nil && len(info.RegistryConfig.Mirrors) > 0 {
+		fmt.Fprintln(dockerCli.Out(), "Registry Mirrors:")
+		for _, mirror := range info.RegistryConfig.Mirrors {
+			fmt.Fprintf(dockerCli.Out(), " %s\n", mirror)
 		}
 	}
 

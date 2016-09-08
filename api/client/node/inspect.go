@@ -8,9 +8,9 @@ import (
 
 	"github.com/docker/docker/api/client"
 	"github.com/docker/docker/api/client/inspect"
+	"github.com/docker/docker/api/types/swarm"
 	"github.com/docker/docker/cli"
 	"github.com/docker/docker/pkg/ioutils"
-	"github.com/docker/engine-api/types/swarm"
 	"github.com/docker/go-units"
 	"github.com/spf13/cobra"
 	"golang.org/x/net/context"
@@ -45,7 +45,7 @@ func runInspect(dockerCli *client.DockerCli, opts inspectOptions) error {
 	client := dockerCli.Client()
 	ctx := context.Background()
 	getRef := func(ref string) (interface{}, []byte, error) {
-		nodeRef, err := Reference(client, ctx, ref)
+		nodeRef, err := Reference(ctx, client, ref)
 		if err != nil {
 			return nil, nil, err
 		}

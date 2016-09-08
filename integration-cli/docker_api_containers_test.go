@@ -15,12 +15,12 @@ import (
 	"strings"
 	"time"
 
+	"github.com/docker/docker/api/types"
+	containertypes "github.com/docker/docker/api/types/container"
+	networktypes "github.com/docker/docker/api/types/network"
 	"github.com/docker/docker/pkg/integration"
 	"github.com/docker/docker/pkg/integration/checker"
 	"github.com/docker/docker/pkg/stringid"
-	"github.com/docker/engine-api/types"
-	containertypes "github.com/docker/engine-api/types/container"
-	networktypes "github.com/docker/engine-api/types/network"
 	"github.com/go-check/check"
 )
 
@@ -881,7 +881,7 @@ func (s *DockerSuite) TestContainerApiStart(c *check.C) {
 	name := "testing-start"
 	config := map[string]interface{}{
 		"Image":     "busybox",
-		"Cmd":       append([]string{"/bin/sh", "-c"}, defaultSleepCommand...),
+		"Cmd":       append([]string{"/bin/sh", "-c"}, sleepCommandForDaemonPlatform()...),
 		"OpenStdin": true,
 	}
 
@@ -1117,7 +1117,7 @@ func (s *DockerSuite) TestContainerApiChunkedEncoding(c *check.C) {
 
 	config := map[string]interface{}{
 		"Image":     "busybox",
-		"Cmd":       append([]string{"/bin/sh", "-c"}, defaultSleepCommand...),
+		"Cmd":       append([]string{"/bin/sh", "-c"}, sleepCommandForDaemonPlatform()...),
 		"OpenStdin": true,
 	}
 	b, err := json.Marshal(config)
