@@ -9,13 +9,13 @@ import (
 	"strings"
 	"testing"
 
-	"github.com/docker/docker/api/types"
+	"github.com/docker/docker/api/types/image"
 	"golang.org/x/net/context"
 )
 
 func TestImageHistoryError(t *testing.T) {
 	client := &Client{
-		transport: newMockClient(nil, errorMock(http.StatusInternalServerError, "Server error")),
+		client: newMockClient(errorMock(http.StatusInternalServerError, "Server error")),
 	}
 	_, err := client.ImageHistory(context.Background(), "nothing")
 	if err == nil || err.Error() != "Error response from daemon: Server error" {
@@ -26,11 +26,11 @@ func TestImageHistoryError(t *testing.T) {
 func TestImageHistory(t *testing.T) {
 	expectedURL := "/images/image_id/history"
 	client := &Client{
-		transport: newMockClient(nil, func(r *http.Request) (*http.Response, error) {
+		client: newMockClient(func(r *http.Request) (*http.Response, error) {
 			if !strings.HasPrefix(r.URL.Path, expectedURL) {
 				return nil, fmt.Errorf("Expected URL '%s', got '%s'", expectedURL, r.URL)
 			}
-			b, err := json.Marshal([]types.ImageHistory{
+			b, err := json.Marshal([]image.HistoryResponseItem{
 				{
 					ID:   "image_id1",
 					Tags: []string{"tag1", "tag2"},

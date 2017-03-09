@@ -15,7 +15,7 @@ import (
 
 func TestServiceInspectError(t *testing.T) {
 	client := &Client{
-		transport: newMockClient(nil, errorMock(http.StatusInternalServerError, "Server error")),
+		client: newMockClient(errorMock(http.StatusInternalServerError, "Server error")),
 	}
 
 	_, _, err := client.ServiceInspectWithRaw(context.Background(), "nothing")
@@ -26,19 +26,19 @@ func TestServiceInspectError(t *testing.T) {
 
 func TestServiceInspectServiceNotFound(t *testing.T) {
 	client := &Client{
-		transport: newMockClient(nil, errorMock(http.StatusNotFound, "Server error")),
+		client: newMockClient(errorMock(http.StatusNotFound, "Server error")),
 	}
 
 	_, _, err := client.ServiceInspectWithRaw(context.Background(), "unknown")
 	if err == nil || !IsErrServiceNotFound(err) {
-		t.Fatalf("expected an serviceNotFoundError error, got %v", err)
+		t.Fatalf("expected a serviceNotFoundError error, got %v", err)
 	}
 }
 
 func TestServiceInspect(t *testing.T) {
 	expectedURL := "/services/service_id"
 	client := &Client{
-		transport: newMockClient(nil, func(req *http.Request) (*http.Response, error) {
+		client: newMockClient(func(req *http.Request) (*http.Response, error) {
 			if !strings.HasPrefix(req.URL.Path, expectedURL) {
 				return nil, fmt.Errorf("Expected URL '%s', got '%s'", expectedURL, req.URL)
 			}

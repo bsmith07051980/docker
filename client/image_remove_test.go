@@ -15,7 +15,7 @@ import (
 
 func TestImageRemoveError(t *testing.T) {
 	client := &Client{
-		transport: newMockClient(nil, errorMock(http.StatusInternalServerError, "Server error")),
+		client: newMockClient(errorMock(http.StatusInternalServerError, "Server error")),
 	}
 
 	_, err := client.ImageRemove(context.Background(), "image_id", types.ImageRemoveOptions{})
@@ -49,7 +49,7 @@ func TestImageRemove(t *testing.T) {
 	}
 	for _, removeCase := range removeCases {
 		client := &Client{
-			transport: newMockClient(nil, func(req *http.Request) (*http.Response, error) {
+			client: newMockClient(func(req *http.Request) (*http.Response, error) {
 				if !strings.HasPrefix(req.URL.Path, expectedURL) {
 					return nil, fmt.Errorf("expected URL '%s', got '%s'", expectedURL, req.URL)
 				}
@@ -63,7 +63,7 @@ func TestImageRemove(t *testing.T) {
 						return nil, fmt.Errorf("%s not set in URL query properly. Expected '%s', got %s", key, expected, actual)
 					}
 				}
-				b, err := json.Marshal([]types.ImageDelete{
+				b, err := json.Marshal([]types.ImageDeleteResponseItem{
 					{
 						Untagged: "image_id1",
 					},

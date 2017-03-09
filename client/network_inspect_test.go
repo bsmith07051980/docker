@@ -15,7 +15,7 @@ import (
 
 func TestNetworkInspectError(t *testing.T) {
 	client := &Client{
-		transport: newMockClient(nil, errorMock(http.StatusInternalServerError, "Server error")),
+		client: newMockClient(errorMock(http.StatusInternalServerError, "Server error")),
 	}
 
 	_, err := client.NetworkInspect(context.Background(), "nothing")
@@ -26,19 +26,19 @@ func TestNetworkInspectError(t *testing.T) {
 
 func TestNetworkInspectContainerNotFound(t *testing.T) {
 	client := &Client{
-		transport: newMockClient(nil, errorMock(http.StatusNotFound, "Server error")),
+		client: newMockClient(errorMock(http.StatusNotFound, "Server error")),
 	}
 
 	_, err := client.NetworkInspect(context.Background(), "unknown")
 	if err == nil || !IsErrNetworkNotFound(err) {
-		t.Fatalf("expected a containerNotFound error, got %v", err)
+		t.Fatalf("expected a networkNotFound error, got %v", err)
 	}
 }
 
 func TestNetworkInspect(t *testing.T) {
 	expectedURL := "/networks/network_id"
 	client := &Client{
-		transport: newMockClient(nil, func(req *http.Request) (*http.Response, error) {
+		client: newMockClient(func(req *http.Request) (*http.Response, error) {
 			if !strings.HasPrefix(req.URL.Path, expectedURL) {
 				return nil, fmt.Errorf("Expected URL '%s', got '%s'", expectedURL, req.URL)
 			}

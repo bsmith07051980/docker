@@ -11,6 +11,7 @@ import (
 	"strings"
 	"testing"
 
+	"github.com/docker/docker/api"
 	"github.com/docker/docker/api/types"
 	"golang.org/x/net/context"
 )
@@ -26,7 +27,7 @@ func TestNewEnvClient(t *testing.T) {
 	}{
 		{
 			envs:            map[string]string{},
-			expectedVersion: DefaultVersion,
+			expectedVersion: api.DefaultVersion,
 		},
 		{
 			envs: map[string]string{
@@ -38,7 +39,21 @@ func TestNewEnvClient(t *testing.T) {
 			envs: map[string]string{
 				"DOCKER_CERT_PATH": "testdata/",
 			},
-			expectedVersion: DefaultVersion,
+			expectedVersion: api.DefaultVersion,
+		},
+		{
+			envs: map[string]string{
+				"DOCKER_CERT_PATH":  "testdata/",
+				"DOCKER_TLS_VERIFY": "1",
+			},
+			expectedVersion: api.DefaultVersion,
+		},
+		{
+			envs: map[string]string{
+				"DOCKER_CERT_PATH": "testdata/",
+				"DOCKER_HOST":      "https://notaunixsocket",
+			},
+			expectedVersion: api.DefaultVersion,
 		},
 		{
 			envs: map[string]string{
@@ -50,7 +65,7 @@ func TestNewEnvClient(t *testing.T) {
 			envs: map[string]string{
 				"DOCKER_HOST": "invalid://url",
 			},
-			expectedVersion: DefaultVersion,
+			expectedVersion: api.DefaultVersion,
 		},
 		{
 			envs: map[string]string{
@@ -69,7 +84,9 @@ func TestNewEnvClient(t *testing.T) {
 		recoverEnvs := setupEnvs(t, c.envs)
 		apiclient, err := NewEnvClient()
 		if c.expectedError != "" {
-			if err == nil || err.Error() != c.expectedError {
+			if err == nil {
+				t.Errorf("expected an error for %v", c)
+			} else if err.Error() != c.expectedError {
 				t.Errorf("expected an error %s, got %s, for %v", c.expectedError, err.Error(), c)
 			}
 		} else {
@@ -81,6 +98,19 @@ func TestNewEnvClient(t *testing.T) {
 				t.Errorf("expected %s, got %s, for %v", c.expectedVersion, version, c)
 			}
 		}
+
+		if c.envs["DOCKER_TLS_VERIFY"] != "" {
+			// pedantic checking that this is handled correctly
+			tr := apiclient.client.Transport.(*http.Transport)
+			if tr.TLSClientConfig == nil {
+				t.Error("no TLS config found when DOCKER_TLS_VERIFY enabled")
+			}
+
+			if tr.TLSClientConfig.InsecureSkipVerify {
+				t.Error("TLS verification should be enabled")
+			}
+		}
+
 		recoverEnvs(t)
 	}
 }
@@ -133,6 +163,11 @@ func TestGetAPIPath(t *testing.T) {
 		if g != cs.e {
 			t.Fatalf("Expected %s, got %s", cs.e, g)
 		}
+
+		err = c.Close()
+		if nil != err {
+			t.Fatalf("close client failed, error message: %s", err)
+		}
 	}
 }
 
@@ -173,7 +208,7 @@ func TestParseHost(t *testing.T) {
 
 func TestUpdateClientVersion(t *testing.T) {
 	client := &Client{
-		transport: newMockClient(nil, func(req *http.Request) (*http.Response, error) {
+		client: newMockClient(func(req *http.Request) (*http.Response, error) {
 			splitQuery := strings.Split(req.URL.Path, "/")
 			queryVersion := splitQuery[1]
 			b, err := json.Marshal(types.Version{
@@ -228,8 +263,8 @@ func TestNewEnvClientSetsDefaultVersion(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if client.version != DefaultVersion {
-		t.Fatalf("Expected %s, got %s", DefaultVersion, client.version)
+	if client.version != api.DefaultVersion {
+		t.Fatalf("Expected %s, got %s", api.DefaultVersion, client.version)
 	}
 
 	expected := "1.22"

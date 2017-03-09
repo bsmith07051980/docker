@@ -1,5 +1,3 @@
-// +build experimental
-
 package client
 
 import (
@@ -10,15 +8,16 @@ import (
 	"strings"
 	"testing"
 
+	"github.com/docker/docker/api/types"
 	"golang.org/x/net/context"
 )
 
 func TestPluginDisableError(t *testing.T) {
 	client := &Client{
-		transport: newMockClient(nil, errorMock(http.StatusInternalServerError, "Server error")),
+		client: newMockClient(errorMock(http.StatusInternalServerError, "Server error")),
 	}
 
-	err := client.PluginDisable(context.Background(), "plugin_name")
+	err := client.PluginDisable(context.Background(), "plugin_name", types.PluginDisableOptions{})
 	if err == nil || err.Error() != "Error response from daemon: Server error" {
 		t.Fatalf("expected a Server Error, got %v", err)
 	}
@@ -28,7 +27,7 @@ func TestPluginDisable(t *testing.T) {
 	expectedURL := "/plugins/plugin_name/disable"
 
 	client := &Client{
-		transport: newMockClient(nil, func(req *http.Request) (*http.Response, error) {
+		client: newMockClient(func(req *http.Request) (*http.Response, error) {
 			if !strings.HasPrefix(req.URL.Path, expectedURL) {
 				return nil, fmt.Errorf("Expected URL '%s', got '%s'", expectedURL, req.URL)
 			}
@@ -42,7 +41,7 @@ func TestPluginDisable(t *testing.T) {
 		}),
 	}
 
-	err := client.PluginDisable(context.Background(), "plugin_name")
+	err := client.PluginDisable(context.Background(), "plugin_name", types.PluginDisableOptions{})
 	if err != nil {
 		t.Fatal(err)
 	}

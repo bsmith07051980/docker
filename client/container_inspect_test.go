@@ -15,7 +15,7 @@ import (
 
 func TestContainerInspectError(t *testing.T) {
 	client := &Client{
-		transport: newMockClient(nil, errorMock(http.StatusInternalServerError, "Server error")),
+		client: newMockClient(errorMock(http.StatusInternalServerError, "Server error")),
 	}
 
 	_, err := client.ContainerInspect(context.Background(), "nothing")
@@ -26,7 +26,7 @@ func TestContainerInspectError(t *testing.T) {
 
 func TestContainerInspectContainerNotFound(t *testing.T) {
 	client := &Client{
-		transport: newMockClient(nil, errorMock(http.StatusNotFound, "Server error")),
+		client: newMockClient(errorMock(http.StatusNotFound, "Server error")),
 	}
 
 	_, err := client.ContainerInspect(context.Background(), "unknown")
@@ -38,7 +38,7 @@ func TestContainerInspectContainerNotFound(t *testing.T) {
 func TestContainerInspect(t *testing.T) {
 	expectedURL := "/containers/container_id/json"
 	client := &Client{
-		transport: newMockClient(nil, func(req *http.Request) (*http.Response, error) {
+		client: newMockClient(func(req *http.Request) (*http.Response, error) {
 			if !strings.HasPrefix(req.URL.Path, expectedURL) {
 				return nil, fmt.Errorf("Expected URL '%s', got '%s'", expectedURL, req.URL)
 			}
@@ -67,16 +67,16 @@ func TestContainerInspect(t *testing.T) {
 		t.Fatalf("expected `container_id`, got %s", r.ID)
 	}
 	if r.Image != "image" {
-		t.Fatalf("expected `image`, got %s", r.ID)
+		t.Fatalf("expected `image`, got %s", r.Image)
 	}
 	if r.Name != "name" {
-		t.Fatalf("expected `name`, got %s", r.ID)
+		t.Fatalf("expected `name`, got %s", r.Name)
 	}
 }
 
 func TestContainerInspectNode(t *testing.T) {
 	client := &Client{
-		transport: newMockClient(nil, func(req *http.Request) (*http.Response, error) {
+		client: newMockClient(func(req *http.Request) (*http.Response, error) {
 			content, err := json.Marshal(types.ContainerJSON{
 				ContainerJSONBase: &types.ContainerJSONBase{
 					ID:    "container_id",
@@ -107,10 +107,10 @@ func TestContainerInspectNode(t *testing.T) {
 		t.Fatalf("expected `container_id`, got %s", r.ID)
 	}
 	if r.Image != "image" {
-		t.Fatalf("expected `image`, got %s", r.ID)
+		t.Fatalf("expected `image`, got %s", r.Image)
 	}
 	if r.Name != "name" {
-		t.Fatalf("expected `name`, got %s", r.ID)
+		t.Fatalf("expected `name`, got %s", r.Name)
 	}
 	if r.Node.ID != "container_node_id" {
 		t.Fatalf("expected `container_node_id`, got %s", r.Node.ID)

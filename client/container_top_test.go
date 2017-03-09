@@ -10,13 +10,13 @@ import (
 	"strings"
 	"testing"
 
-	"github.com/docker/docker/api/types"
+	"github.com/docker/docker/api/types/container"
 	"golang.org/x/net/context"
 )
 
 func TestContainerTopError(t *testing.T) {
 	client := &Client{
-		transport: newMockClient(nil, errorMock(http.StatusInternalServerError, "Server error")),
+		client: newMockClient(errorMock(http.StatusInternalServerError, "Server error")),
 	}
 	_, err := client.ContainerTop(context.Background(), "nothing", []string{})
 	if err == nil || err.Error() != "Error response from daemon: Server error" {
@@ -33,7 +33,7 @@ func TestContainerTop(t *testing.T) {
 	expectedTitles := []string{"title1", "title2"}
 
 	client := &Client{
-		transport: newMockClient(nil, func(req *http.Request) (*http.Response, error) {
+		client: newMockClient(func(req *http.Request) (*http.Response, error) {
 			if !strings.HasPrefix(req.URL.Path, expectedURL) {
 				return nil, fmt.Errorf("Expected URL '%s', got '%s'", expectedURL, req.URL)
 			}
@@ -43,7 +43,7 @@ func TestContainerTop(t *testing.T) {
 				return nil, fmt.Errorf("args not set in URL query properly. Expected 'arg1 arg2', got %v", args)
 			}
 
-			b, err := json.Marshal(types.ContainerProcessList{
+			b, err := json.Marshal(container.ContainerTopOKBody{
 				Processes: [][]string{
 					{"p1", "p2"},
 					{"p3"},
