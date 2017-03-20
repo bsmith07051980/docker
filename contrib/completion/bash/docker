@@ -101,6 +101,10 @@ __docker_complete_containers_all() {
 	__docker_complete_containers "$@" --all
 }
 
+__docker_complete_containers_removable() {
+	__docker_complete_containers "$@" --filter status=created --filter status=exited
+}
+
 __docker_complete_containers_running() {
 	__docker_complete_containers "$@" --filter status=running
 }
@@ -1430,7 +1434,7 @@ _docker_container_rm() {
 						;;
 				esac
 			done
-			__docker_complete_containers_stopped
+			__docker_complete_containers_removable
 			;;
 	esac
 }
@@ -3522,7 +3526,11 @@ _docker_node_update() {
 			COMPREPLY=( $( compgen -W "--availability --help --label-add --label-rm --role" -- "$cur" ) )
 			;;
 		*)
-			__docker_complete_nodes
+			local counter=$(__docker_pos_first_nonflag '--availability|--label-add|--label-rm|--role')
+			if [ $cword -eq $counter ]; then
+				__docker_complete_nodes
+			fi
+			;;
 	esac
 }
 
