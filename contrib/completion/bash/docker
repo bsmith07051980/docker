@@ -1522,7 +1522,6 @@ _docker_container_run_and_create() {
 	__docker_daemon_os_is windows && options_with_args+="
 		--cpu-count
 		--cpu-percent
-		--credentialspec
 		--io-maxbandwidth
 		--io-maxiops
 		--isolation
@@ -2717,6 +2716,10 @@ _docker_network_ls() {
 			__docker_complete_networks --cur "${cur##*=}" --name
 			return
 			;;
+		scope)
+			COMPREPLY=( $( compgen -W "global local swarm" -- "${cur##*=}" ) )
+			return
+			;;
 		type)
 			COMPREPLY=( $( compgen -W "builtin custom" -- "${cur##*=}" ) )
 			return
@@ -2725,7 +2728,7 @@ _docker_network_ls() {
 
 	case "$prev" in
 		--filter|-f)
-			COMPREPLY=( $( compgen -S = -W "driver id label name type" -- "$cur" ) )
+			COMPREPLY=( $( compgen -S = -W "driver id label name scope type" -- "$cur" ) )
 			__docker_nospace
 			return
 			;;

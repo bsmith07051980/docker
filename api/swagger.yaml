@@ -245,6 +245,9 @@ definitions:
       ReadOnly:
         description: "Whether the mount should be read-only."
         type: "boolean"
+      Consistency:
+        description: "The consistency requirement for the mount: `default`, `consistent`, `cached`, or `delegated`."
+        type: "string"
       BindOptions:
         description: "Optional configuration for the `bind` type."
         type: "object"
@@ -487,10 +490,10 @@ definitions:
         description: |
           The test to perform. Possible values are:
 
-          - `{}` inherit healthcheck from image or parent image
-          - `{"NONE"}` disable healthcheck
-          - `{"CMD", args...}` exec arguments directly
-          - `{"CMD-SHELL", command}` run command with system's default shell
+          - `[]` inherit healthcheck from image or parent image
+          - `["NONE"]` disable healthcheck
+          - `["CMD", args...]` exec arguments directly
+          - `["CMD-SHELL", command]` run command with system's default shell
         type: "array"
         items:
           type: "string"
@@ -1114,6 +1117,8 @@ definitions:
         type: "boolean"
       Attachable:
         type: "boolean"
+      Ingress:
+        type: "boolean"
       Containers:
         type: "object"
         additionalProperties:
@@ -1142,6 +1147,7 @@ definitions:
           foo: "bar"
       Internal: false
       Attachable: false
+      Ingress: false
       Containers:
         19a4d5d687db25203351ed79d478946f861258f018fe384f229f2efa4b23513c:
           Name: "test"
@@ -1445,11 +1451,17 @@ definitions:
           - WorkDir
           - Network
           - Linux
+          - PidHost
           - PropagatedMount
+          - IpcHost
           - Mounts
           - Env
           - Args
         properties:
+          DockerVersion:
+            description: "Docker Version used to create the plugin"
+            type: "string"
+            x-nullable: false
           Description:
             type: "string"
             x-nullable: false
@@ -1512,6 +1524,12 @@ definitions:
                   $ref: "#/definitions/PluginDevice"
           PropagatedMount:
             type: "string"
+            x-nullable: false
+          IpcHost:
+            type: "boolean"
+            x-nullable: false
+          PidHost:
+            type: "boolean"
             x-nullable: false
           Mounts:
             type: "array"
@@ -6196,6 +6214,7 @@ paths:
                 EnableIPv6: false
                 Internal: false
                 Attachable: false
+                Ingress: false
                 IPAM:
                   Driver: "default"
                   Config:
@@ -6222,6 +6241,7 @@ paths:
                 EnableIPv6: false
                 Internal: false
                 Attachable: false
+                Ingress: false
                 IPAM:
                   Driver: "default"
                   Config: []
@@ -6235,6 +6255,7 @@ paths:
                 EnableIPv6: false
                 Internal: false
                 Attachable: false
+                Ingress: false
                 IPAM:
                   Driver: "default"
                   Config: []
@@ -6254,6 +6275,7 @@ paths:
             - `id=<network-id>` Matches all or part of a network ID.
             - `label=<key>` or `label=<key>=<value>` of a network label.
             - `name=<network-name>` Matches all or part of a network name.
+            - `scope=["swarm"|"global"|"local"]` Filters networks by scope (`swarm`, `global`, or `local`).
             - `type=["custom"|"builtin"]` Filters networks by type. The `custom` keyword returns all user-defined networks.
           type: "string"
       tags: ["Network"]
@@ -6367,6 +6389,9 @@ paths:
               Attachable:
                 description: "Globally scoped network is manually attachable by regular containers from workers in swarm mode."
                 type: "boolean"
+              Ingress:
+                description: "Ingress network is the network which provides the routing-mesh in swarm mode."
+                type: "boolean"
               IPAM:
                 description: "Optional custom IP scheme for the network."
                 $ref: "#/definitions/IPAM"
@@ -6400,6 +6425,7 @@ paths:
                   foo: "bar"
               Internal: true
               Attachable: false
+              Ingress: false
               Options:
                 com.docker.network.bridge.default_bridge: "true"
                 com.docker.network.bridge.enable_icc: "true"
