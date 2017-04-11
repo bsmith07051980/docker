@@ -60,7 +60,7 @@ func (s *DockerSwarmSuite) TestSwarmInit(c *check.C) {
 		return sw.Spec
 	}
 
-	cli.Docker(cli.Cmd("swarm", "init", "--cert-expiry", "30h", "--dispatcher-heartbeat", "11s"),
+	cli.Docker(cli.Args("swarm", "init", "--cert-expiry", "30h", "--dispatcher-heartbeat", "11s"),
 		cli.Daemon(d.Daemon)).Assert(c, icmd.Success)
 
 	spec := getSpec()
@@ -69,7 +69,7 @@ func (s *DockerSwarmSuite) TestSwarmInit(c *check.C) {
 
 	c.Assert(d.Leave(true), checker.IsNil)
 	time.Sleep(500 * time.Millisecond) // https://github.com/docker/swarmkit/issues/1421
-	cli.Docker(cli.Cmd("swarm", "init"), cli.Daemon(d.Daemon)).Assert(c, icmd.Success)
+	cli.Docker(cli.Args("swarm", "init"), cli.Daemon(d.Daemon)).Assert(c, icmd.Success)
 
 	spec = getSpec()
 	c.Assert(spec.CAConfig.NodeCertExpiry, checker.Equals, 90*24*time.Hour)
@@ -79,12 +79,12 @@ func (s *DockerSwarmSuite) TestSwarmInit(c *check.C) {
 func (s *DockerSwarmSuite) TestSwarmInitIPv6(c *check.C) {
 	testRequires(c, IPv6)
 	d1 := s.AddDaemon(c, false, false)
-	cli.Docker(cli.Cmd("swarm", "init", "--listen-add", "::1"), cli.Daemon(d1.Daemon)).Assert(c, icmd.Success)
+	cli.Docker(cli.Args("swarm", "init", "--listen-add", "::1"), cli.Daemon(d1.Daemon)).Assert(c, icmd.Success)
 
 	d2 := s.AddDaemon(c, false, false)
-	cli.Docker(cli.Cmd("swarm", "join", "::1"), cli.Daemon(d2.Daemon)).Assert(c, icmd.Success)
+	cli.Docker(cli.Args("swarm", "join", "::1"), cli.Daemon(d2.Daemon)).Assert(c, icmd.Success)
 
-	out := cli.Docker(cli.Cmd("info"), cli.Daemon(d2.Daemon)).Assert(c, icmd.Success).Combined()
+	out := cli.Docker(cli.Args("info"), cli.Daemon(d2.Daemon)).Assert(c, icmd.Success).Combined()
 	c.Assert(out, checker.Contains, "Swarm: active")
 }
 
@@ -468,6 +468,24 @@ func (s *DockerSwarmSuite) TestSwarmIngressNetwork(c *check.C) {
 	c.Assert(err, checker.IsNil, check.Commentf(out))
 }
 
+func (s *DockerSwarmSuite) TestSwarmCreateServiceWithNoIngressNetwork(c *check.C) {
+	d := s.AddDaemon(c, true, true)
+
+	// Remove ingress network
+	out, _, err := testutil.RunCommandPipelineWithOutput(
+		exec.Command("echo", "Y"),
+		exec.Command("docker", "-H", d.Sock(), "network", "rm", "ingress"),
+	)
+	c.Assert(err, checker.IsNil, check.Commentf(out))
+
+	// Create a overlay network and launch a service on it
+	// Make sure nothing panics because ingress network is missing
+	out, err = d.Cmd("network", "create", "-d", "overlay", "another-network")
+	c.Assert(err, checker.IsNil, check.Commentf(out))
+	out, err = d.Cmd("service", "create", "--name", "srv4", "--network", "another-network", "busybox", "top")
+	c.Assert(err, checker.IsNil, check.Commentf(out))
+}
+
 // Test case for #24108, also the case from:
 // https://github.com/docker/docker/pull/24620#issuecomment-233715656
 func (s *DockerSwarmSuite) TestSwarmTaskListFilter(c *check.C) {
@@ -835,6 +853,45 @@ func (s *DockerSwarmSuite) TestSwarmServiceTTYUpdate(c *check.C) {
 	out, err = d.Cmd("service", "inspect", "--format", "{{ .Spec.TaskTemplate.ContainerSpec.TTY }}", name)
 	c.Assert(err, checker.IsNil)
 	c.Assert(strings.TrimSpace(out), checker.Equals, "true")
+}
+
+func (s *DockerSwarmSuite) TestSwarmServiceNetworkUpdate(c *check.C) {
+	d := s.AddDaemon(c, true, true)
+
+	result := icmd.RunCmd(d.Command("network", "create", "-d", "overlay", "foo"))
+	result.Assert(c, icmd.Success)
+	fooNetwork := strings.TrimSpace(string(result.Combined()))
+
+	result = icmd.RunCmd(d.Command("network", "create", "-d", "overlay", "bar"))
+	result.Assert(c, icmd.Success)
+	barNetwork := strings.TrimSpace(string(result.Combined()))
+
+	result = icmd.RunCmd(d.Command("network", "create", "-d", "overlay", "baz"))
+	result.Assert(c, icmd.Success)
+	bazNetwork := strings.TrimSpace(string(result.Combined()))
+
+	// Create a service
+	name := "top"
+	result = icmd.RunCmd(d.Command("service", "create", "--network", "foo", "--network", "bar", "--name", name, "busybox", "top"))
+	result.Assert(c, icmd.Success)
+
+	// Make sure task has been deployed.
+	waitAndAssert(c, defaultReconciliationTimeout, d.CheckRunningTaskNetworks, checker.DeepEquals,
+		map[string]int{fooNetwork: 1, barNetwork: 1})
+
+	// Remove a network
+	result = icmd.RunCmd(d.Command("service", "update", "--network-rm", "foo", name))
+	result.Assert(c, icmd.Success)
+
+	waitAndAssert(c, defaultReconciliationTimeout, d.CheckRunningTaskNetworks, checker.DeepEquals,
+		map[string]int{barNetwork: 1})
+
+	// Add a network
+	result = icmd.RunCmd(d.Command("service", "update", "--network-add", "baz", name))
+	result.Assert(c, icmd.Success)
+
+	waitAndAssert(c, defaultReconciliationTimeout, d.CheckRunningTaskNetworks, checker.DeepEquals,
+		map[string]int{barNetwork: 1, bazNetwork: 1})
 }
 
 func (s *DockerSwarmSuite) TestDNSConfig(c *check.C) {
@@ -1593,13 +1650,13 @@ func (s *DockerSwarmSuite) TestSwarmServicePsMultipleServiceIDs(c *check.C) {
 	d := s.AddDaemon(c, true, true)
 
 	name1 := "top1"
-	out, err := d.Cmd("service", "create", "--name", name1, "--replicas=3", "busybox", "top")
+	out, err := d.Cmd("service", "create", "--detach=true", "--name", name1, "--replicas=3", "busybox", "top")
 	c.Assert(err, checker.IsNil)
 	c.Assert(strings.TrimSpace(out), checker.Not(checker.Equals), "")
 	id1 := strings.TrimSpace(out)
 
 	name2 := "top2"
-	out, err = d.Cmd("service", "create", "--name", name2, "--replicas=3", "busybox", "top")
+	out, err = d.Cmd("service", "create", "--detach=true", "--name", name2, "--replicas=3", "busybox", "top")
 	c.Assert(err, checker.IsNil)
 	c.Assert(strings.TrimSpace(out), checker.Not(checker.Equals), "")
 	id2 := strings.TrimSpace(out)
@@ -1662,7 +1719,7 @@ func (s *DockerSwarmSuite) TestSwarmServicePsMultipleServiceIDs(c *check.C) {
 func (s *DockerSwarmSuite) TestSwarmPublishDuplicatePorts(c *check.C) {
 	d := s.AddDaemon(c, true, true)
 
-	out, err := d.Cmd("service", "create", "--publish", "5005:80", "--publish", "5006:80", "--publish", "80", "--publish", "80", "busybox", "top")
+	out, err := d.Cmd("service", "create", "--detach=true", "--publish", "5005:80", "--publish", "5006:80", "--publish", "80", "--publish", "80", "busybox", "top")
 	c.Assert(err, check.IsNil, check.Commentf(out))
 	id := strings.TrimSpace(out)
 

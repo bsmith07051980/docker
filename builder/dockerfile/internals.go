@@ -13,7 +13,6 @@ import (
 	"net/url"
 	"os"
 	"path/filepath"
-	"regexp"
 	"runtime"
 	"sort"
 	"strings"
@@ -44,7 +43,7 @@ func (b *Builder) commit(id string, autoCmd strslice.StrSlice, comment string) e
 	if b.disableCommit {
 		return nil
 	}
-	if b.image == "" && !b.noBaseImage {
+	if !b.hasFromImage() {
 		return errors.New("Please provide a source image with `from` prior to commit")
 	}
 	b.runConfig.Image = b.image
@@ -85,7 +84,7 @@ func (b *Builder) commit(id string, autoCmd strslice.StrSlice, comment string) e
 	}
 
 	b.image = imageID
-	b.imageContexts.update(imageID)
+	b.imageContexts.update(imageID, &autoConfig)
 	return nil
 }
 
@@ -94,7 +93,7 @@ type copyInfo struct {
 	decompress bool
 }
 
-func (b *Builder) runContextCommand(args []string, allowRemote bool, allowLocalDecompression bool, cmdName string, contextID *int) error {
+func (b *Builder) runContextCommand(args []string, allowRemote bool, allowLocalDecompression bool, cmdName string, imageSource *imageMount) error {
 	if len(args) < 2 {
 		return fmt.Errorf("Invalid %s format - at least two arguments required", cmdName)
 	}
@@ -128,7 +127,7 @@ func (b *Builder) runContextCommand(args []string, allowRemote bool, allowLocalD
 			continue
 		}
 		// not a URL
-		subInfos, err := b.calcCopyInfo(cmdName, orig, allowLocalDecompression, true, contextID)
+		subInfos, err := b.calcCopyInfo(cmdName, orig, allowLocalDecompression, true, imageSource)
 		if err != nil {
 			return err
 		}
@@ -298,16 +297,30 @@ func (b *Builder) download(srcURL string) (fi builder.FileInfo, err error) {
 	return &builder.HashedFileInfo{FileInfo: builder.PathFileInfo{FileInfo: tmpFileSt, FilePath: tmpFileName}, FileHash: hash}, nil
 }
 
-func (b *Builder) calcCopyInfo(cmdName, origPath string, allowLocalDecompression, allowWildcards bool, contextID *int) ([]copyInfo, error) {
+var windowsBlacklist = map[string]bool{
+	"c:\\":        true,
+	"c:\\windows": true,
+}
+
+func (b *Builder) calcCopyInfo(cmdName, origPath string, allowLocalDecompression, allowWildcards bool, imageSource *imageMount) ([]copyInfo, error) {
 
 	// Work in daemon-specific OS filepath semantics
 	origPath = filepath.FromSlash(origPath)
-
 	// validate windows paths from other images
-	if contextID != nil && runtime.GOOS == "windows" {
-		forbid := regexp.MustCompile("(?i)^" + string(os.PathSeparator) + "?(windows(" + string(os.PathSeparator) + ".+)?)?$")
-		if p := filepath.Clean(origPath); p == "." || forbid.MatchString(p) {
-			return nil, errors.Errorf("copy from %s is not allowed on windows", origPath)
+	if imageSource != nil && runtime.GOOS == "windows" {
+		p := strings.ToLower(filepath.Clean(origPath))
+		if !filepath.IsAbs(p) {
+			if filepath.VolumeName(p) != "" {
+				if p[len(p)-2:] == ":." { // case where clean returns weird c:. paths
+					p = p[:len(p)-1]
+				}
+				p += "\\"
+			} else {
+				p = filepath.Join("c:\\", p)
+			}
+		}
+		if _, blacklisted := windowsBlacklist[p]; blacklisted {
+			return nil, errors.New("copy from c:\\ or c:\\windows is not allowed on windows")
 		}
 	}
 
@@ -318,8 +331,8 @@ func (b *Builder) calcCopyInfo(cmdName, origPath string, allowLocalDecompression
 
 	context := b.context
 	var err error
-	if contextID != nil {
-		context, err = b.imageContexts.context(*contextID)
+	if imageSource != nil {
+		context, err = imageSource.context()
 		if err != nil {
 			return nil, err
 		}
@@ -346,7 +359,7 @@ func (b *Builder) calcCopyInfo(cmdName, origPath string, allowLocalDecompression
 
 			// Note we set allowWildcards to false in case the name has
 			// a * in it
-			subInfos, err := b.calcCopyInfo(cmdName, path, allowLocalDecompression, false, contextID)
+			subInfos, err := b.calcCopyInfo(cmdName, path, allowLocalDecompression, false, imageSource)
 			if err != nil {
 				return err
 			}
@@ -370,9 +383,9 @@ func (b *Builder) calcCopyInfo(cmdName, origPath string, allowLocalDecompression
 	if !handleHash {
 		return copyInfos, nil
 	}
-	if contextID != nil {
+	if imageSource != nil {
 		// fast-cache based on imageID
-		if h, ok := b.imageContexts.getCache(*contextID, origPath); ok {
+		if h, ok := b.imageContexts.getCache(imageSource.id, origPath); ok {
 			hfi.SetHash(h.(string))
 			return copyInfos, nil
 		}
@@ -401,8 +414,8 @@ func (b *Builder) calcCopyInfo(cmdName, origPath string, allowLocalDecompression
 	hasher := sha256.New()
 	hasher.Write([]byte(strings.Join(subfiles, ",")))
 	hfi.SetHash("dir:" + hex.EncodeToString(hasher.Sum(nil)))
-	if contextID != nil {
-		b.imageContexts.setCache(*contextID, origPath, hfi.Hash())
+	if imageSource != nil {
+		b.imageContexts.setCache(imageSource.id, origPath, hfi.Hash())
 	}
 
 	return copyInfos, nil
@@ -497,13 +510,13 @@ func (b *Builder) probeCache() (bool, error) {
 	fmt.Fprint(b.Stdout, " ---> Using cache\n")
 	logrus.Debugf("[BUILDER] Use cached version: %s", b.runConfig.Cmd)
 	b.image = string(cache)
-	b.imageContexts.update(b.image)
+	b.imageContexts.update(b.image, b.runConfig)
 
 	return true, nil
 }
 
 func (b *Builder) create() (string, error) {
-	if b.image == "" && !b.noBaseImage {
+	if !b.hasFromImage() {
 		return "", errors.New("Please provide a source image with `from` prior to run")
 	}
 	b.runConfig.Image = b.image
@@ -637,7 +650,7 @@ func (b *Builder) clearTmp() {
 }
 
 // readDockerfile reads a Dockerfile from the current context.
-func (b *Builder) readDockerfile() error {
+func (b *Builder) readDockerfile() (*parser.Node, error) {
 	// If no -f was specified then look for 'Dockerfile'. If we can't find
 	// that then look for 'dockerfile'.  If neither are found then default
 	// back to 'Dockerfile' and use that in the error message.
@@ -651,10 +664,9 @@ func (b *Builder) readDockerfile() error {
 		}
 	}
 
-	err := b.parseDockerfile()
-
+	nodes, err := b.parseDockerfile()
 	if err != nil {
-		return err
+		return nodes, err
 	}
 
 	// After the Dockerfile has been parsed, we need to check the .dockerignore
@@ -668,65 +680,27 @@ func (b *Builder) readDockerfile() error {
 	if dockerIgnore, ok := b.context.(builder.DockerIgnoreContext); ok {
 		dockerIgnore.Process([]string{b.options.Dockerfile})
 	}
-	return nil
+	return nodes, nil
 }
 
-func (b *Builder) parseDockerfile() error {
+func (b *Builder) parseDockerfile() (*parser.Node, error) {
 	f, err := b.context.Open(b.options.Dockerfile)
 	if err != nil {
 		if os.IsNotExist(err) {
-			return fmt.Errorf("Cannot locate specified Dockerfile: %s", b.options.Dockerfile)
+			return nil, fmt.Errorf("Cannot locate specified Dockerfile: %s", b.options.Dockerfile)
 		}
-		return err
+		return nil, err
 	}
 	defer f.Close()
 	if f, ok := f.(*os.File); ok {
 		// ignoring error because Open already succeeded
 		fi, err := f.Stat()
 		if err != nil {
-			return fmt.Errorf("Unexpected error reading Dockerfile: %v", err)
+			return nil, fmt.Errorf("Unexpected error reading Dockerfile: %v", err)
 		}
 		if fi.Size() == 0 {
-			return fmt.Errorf("The Dockerfile (%s) cannot be empty", b.options.Dockerfile)
+			return nil, fmt.Errorf("The Dockerfile (%s) cannot be empty", b.options.Dockerfile)
 		}
 	}
-	b.dockerfile, err = parser.Parse(f, &b.directive)
-	if err != nil {
-		return err
-	}
-
-	return nil
-}
-
-func (b *Builder) getBuildArg(arg string) (string, bool) {
-	defaultValue, defined := b.allowedBuildArgs[arg]
-	_, builtin := BuiltinAllowedBuildArgs[arg]
-	if defined || builtin {
-		if v, ok := b.options.BuildArgs[arg]; ok && v != nil {
-			return *v, ok
-		}
-	}
-	if defaultValue == nil {
-		return "", false
-	}
-	return *defaultValue, defined
-}
-
-func (b *Builder) getBuildArgs() map[string]string {
-	m := make(map[string]string)
-	for arg := range b.options.BuildArgs {
-		v, ok := b.getBuildArg(arg)
-		if ok {
-			m[arg] = v
-		}
-	}
-	for arg := range b.allowedBuildArgs {
-		if _, ok := m[arg]; !ok {
-			v, ok := b.getBuildArg(arg)
-			if ok {
-				m[arg] = v
-			}
-		}
-	}
-	return m
+	return parser.Parse(f, &b.directive)
 }

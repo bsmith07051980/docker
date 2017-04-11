@@ -187,20 +187,16 @@ func dispatchCopy(b *Builder, args []string, attributes map[string]bool, origina
 		return err
 	}
 
-	var contextID *int
+	var im *imageMount
 	if flFrom.IsUsed() {
 		var err error
-		context, err := strconv.Atoi(flFrom.Value)
+		im, err = b.imageContexts.get(flFrom.Value)
 		if err != nil {
-			return errors.Wrap(err, "from expects an integer value corresponding to the context number")
-		}
-		if err := b.imageContexts.validate(context); err != nil {
 			return err
 		}
-		contextID = &context
 	}
 
-	return b.runContextCommand(args, false, false, "COPY", contextID)
+	return b.runContextCommand(args, false, false, "COPY", im)
 }
 
 // FROM imagename
@@ -208,7 +204,13 @@ func dispatchCopy(b *Builder, args []string, attributes map[string]bool, origina
 // This sets the image the dockerfile will build on top of.
 //
 func from(b *Builder, args []string, attributes map[string]bool, original string) error {
-	if len(args) != 1 {
+	ctxName := ""
+	if len(args) == 3 && strings.EqualFold(args[1], "as") {
+		ctxName = strings.ToLower(args[2])
+		if ok, _ := regexp.MatchString("^[a-z][a-z0-9-_\\.]*$", ctxName); !ok {
+			return errors.Errorf("invalid name for build stage: %q, name can't start with a number or contain symbols", ctxName)
+		}
+	} else if len(args) != 1 {
 		return errExactlyOneArgument("FROM")
 	}
 
@@ -216,39 +218,49 @@ func from(b *Builder, args []string, attributes map[string]bool, original string
 		return err
 	}
 
-	name := args[0]
+	substituionArgs := []string{}
+	for key, value := range b.buildArgs.GetAllMeta() {
+		substituionArgs = append(substituionArgs, key+"="+value)
+	}
+
+	name, err := ProcessWord(args[0], substituionArgs, b.directive.EscapeToken)
+	if err != nil {
+		return err
+	}
 
 	var image builder.Image
 
 	b.resetImageCache()
-	b.imageContexts.new()
+	if _, err := b.imageContexts.new(ctxName, true); err != nil {
+		return err
+	}
 
-	// Windows cannot support a container with no base image.
-	if name == api.NoBaseImageSpecifier {
-		if runtime.GOOS == "windows" {
-			return errors.New("Windows does not support FROM scratch")
+	if im, ok := b.imageContexts.byName[name]; ok {
+		if len(im.ImageID()) > 0 {
+			image = im
 		}
-		b.image = ""
-		b.noBaseImage = true
 	} else {
-		// TODO: don't use `name`, instead resolve it to a digest
-		if !b.options.PullParent {
-			image, _ = b.docker.GetImageOnBuild(name)
-			// TODO: shouldn't we error out if error is different from "not found" ?
-		}
-		if image == nil {
+		// Windows cannot support a container with no base image.
+		if name == api.NoBaseImageSpecifier {
+			if runtime.GOOS == "windows" {
+				return errors.New("Windows does not support FROM scratch")
+			}
+			b.image = ""
+			b.noBaseImage = true
+		} else {
 			var err error
-			image, err = b.docker.PullOnBuild(b.clientCtx, name, b.options.AuthConfigs, b.Output)
+			image, err = pullOrGetImage(b, name)
 			if err != nil {
 				return err
 			}
 		}
-		b.imageContexts.update(image.ImageID())
+	}
+	if image != nil {
+		b.imageContexts.update(image.ImageID(), image.RunConfig())
 	}
 	b.from = image
 
-	b.allowedBuildArgs = make(map[string]*string)
-
+	b.buildArgs.ResetAllowed()
 	return b.processImageFrom(image)
 }
 
@@ -355,7 +367,7 @@ func workdir(b *Builder, args []string, attributes map[string]bool, original str
 // RUN [ "echo", "hi" ] # echo hi
 //
 func run(b *Builder, args []string, attributes map[string]bool, original string) error {
-	if b.image == "" && !b.noBaseImage {
+	if !b.hasFromImage() {
 		return errors.New("Please provide a source image with `from` prior to run")
 	}
 
@@ -433,7 +445,7 @@ func run(b *Builder, args []string, attributes map[string]bool, original string)
 	// properly match it.
 	b.runConfig.Env = env
 
-	// remove BuiltinAllowedBuildArgs (see: builder.go)  from the saveCmd
+	// remove builtinAllowedBuildArgs (see: builder.go)  from the saveCmd
 	// these args are transparent so resulting image should be the same regardless of the value
 	if len(cmdBuildEnv) > 0 {
 		saveCmd = config.Cmd
@@ -441,11 +453,8 @@ func run(b *Builder, args []string, attributes map[string]bool, original string)
 		copy(tmpBuildEnv, cmdBuildEnv)
 		for i, env := range tmpBuildEnv {
 			key := strings.SplitN(env, "=", 2)[0]
-			if _, ok := BuiltinAllowedBuildArgs[key]; ok {
-				// If an built-in arg is explicitly added in the Dockerfile, don't prune it
-				if _, ok := b.allowedBuildArgs[key]; !ok {
-					tmpBuildEnv = append(tmpBuildEnv[:i], tmpBuildEnv[i+1:]...)
-				}
+			if b.buildArgs.IsUnreferencedBuiltin(key) {
+				tmpBuildEnv = append(tmpBuildEnv[:i], tmpBuildEnv[i+1:]...)
 			}
 		}
 		sort.Strings(tmpBuildEnv)
@@ -535,6 +544,7 @@ func healthcheck(b *Builder, args []string, attributes map[string]bool, original
 
 		flInterval := b.flags.AddString("interval", "")
 		flTimeout := b.flags.AddString("timeout", "")
+		flStartPeriod := b.flags.AddString("start-period", "")
 		flRetries := b.flags.AddString("retries", "")
 
 		if err := b.flags.Parse(); err != nil {
@@ -568,6 +578,12 @@ func healthcheck(b *Builder, args []string, attributes map[string]bool, original
 			return err
 		}
 		healthcheck.Timeout = timeout
+
+		startPeriod, err := parseOptInterval(flStartPeriod)
+		if err != nil {
+			return err
+		}
+		healthcheck.StartPeriod = startPeriod
 
 		if flRetries.Value != "" {
 			retries, err := strconv.ParseInt(flRetries.Value, 10, 32)
@@ -769,15 +785,18 @@ func arg(b *Builder, args []string, attributes map[string]bool, original string)
 		name = arg
 		hasDefault = false
 	}
-	// add the arg to allowed list of build-time args from this step on.
-	b.allBuildArgs[name] = struct{}{}
 
 	var value *string
 	if hasDefault {
 		value = &newValue
 	}
-	b.allowedBuildArgs[name] = value
+	b.buildArgs.AddArg(name, value)
 
+	// Arg before FROM doesn't add a layer
+	if !b.hasFromImage() {
+		b.buildArgs.AddMetaArg(name, value)
+		return nil
+	}
 	return b.commit("", b.runConfig.Cmd, fmt.Sprintf("ARG %s", arg))
 }
 
@@ -827,7 +846,37 @@ func errTooManyArguments(command string) error {
 // shell-form of RUN, ENTRYPOINT and CMD instructions
 func getShell(c *container.Config) []string {
 	if 0 == len(c.Shell) {
-		return defaultShell[:]
+		return append([]string{}, defaultShell[:]...)
 	}
-	return c.Shell[:]
+	return append([]string{}, c.Shell[:]...)
+}
+
+// mountByRef creates an imageMount from a reference. pulling the image if needed.
+func mountByRef(b *Builder, name string) (*imageMount, error) {
+	image, err := pullOrGetImage(b, name)
+	if err != nil {
+		return nil, err
+	}
+	im, err := b.imageContexts.new("", false)
+	if err != nil {
+		return nil, err
+	}
+	im.id = image.ImageID()
+	return im, nil
+}
+
+func pullOrGetImage(b *Builder, name string) (builder.Image, error) {
+	var image builder.Image
+	if !b.options.PullParent {
+		image, _ = b.docker.GetImageOnBuild(name)
+		// TODO: shouldn't we error out if error is different from "not found" ?
+	}
+	if image == nil {
+		var err error
+		image, err = b.docker.PullOnBuild(b.clientCtx, name, b.options.AuthConfigs, b.Output)
+		if err != nil {
+			return nil, err
+		}
+	}
+	return image, nil
 }

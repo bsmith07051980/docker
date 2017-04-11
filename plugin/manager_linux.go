@@ -88,9 +88,18 @@ func (pm *Manager) pluginPostStart(p *v2.Plugin, c *controller) error {
 
 	p.SetPClient(client)
 
+	// Initial sleep before net Dial to allow plugin to listen on socket.
+	time.Sleep(500 * time.Millisecond)
 	maxRetries := 3
 	var retries int
 	for {
+		// net dial into the unix socket to see if someone's listening.
+		conn, err := net.Dial("unix", sockAddr)
+		if err == nil {
+			conn.Close()
+			break
+		}
+
 		time.Sleep(3 * time.Second)
 		retries++
 
@@ -103,12 +112,6 @@ func (pm *Manager) pluginPostStart(p *v2.Plugin, c *controller) error {
 			return err
 		}
 
-		// net dial into the unix socket to see if someone's listening.
-		conn, err := net.Dial("unix", sockAddr)
-		if err == nil {
-			conn.Close()
-			break
-		}
 	}
 	pm.config.Store.SetState(p, true)
 	pm.config.Store.CallHandler(p)
@@ -207,9 +210,8 @@ func (pm *Manager) upgradePlugin(p *v2.Plugin, configDigest digest.Digest, blobs
 				logrus.WithError(rmErr).WithField("dir", backup).Error("error cleaning up after failed upgrade")
 				return
 			}
-
-			if err := os.Rename(backup, orig); err != nil {
-				err = errors.Wrap(err, "error restoring old plugin root on upgrade failure")
+			if mvErr := os.Rename(backup, orig); mvErr != nil {
+				err = errors.Wrap(mvErr, "error restoring old plugin root on upgrade failure")
 			}
 			if rmErr := os.RemoveAll(tmpRootFSDir); rmErr != nil && !os.IsNotExist(rmErr) {
 				logrus.WithError(rmErr).WithField("plugin", p.Name()).Errorf("error cleaning up plugin upgrade dir: %s", tmpRootFSDir)

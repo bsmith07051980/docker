@@ -22,6 +22,7 @@ import (
 	"time"
 
 	"github.com/docker/docker/integration-cli/checker"
+	"github.com/docker/docker/integration-cli/cli"
 	"github.com/docker/docker/integration-cli/cli/build"
 	"github.com/docker/docker/pkg/mount"
 	"github.com/docker/docker/pkg/stringid"
@@ -1285,19 +1286,19 @@ func (s *DockerSuite) TestRunDNSOptions(c *check.C) {
 	// Not applicable on Windows as Windows does not support --dns*, or
 	// the Unix-specific functionality of resolv.conf.
 	testRequires(c, DaemonIsLinux)
-	out, stderr, _ := dockerCmdWithStdoutStderr(c, "run", "--dns=127.0.0.1", "--dns-search=mydomain", "--dns-opt=ndots:9", "busybox", "cat", "/etc/resolv.conf")
+	result := cli.DockerCmd(c, "run", "--dns=127.0.0.1", "--dns-search=mydomain", "--dns-opt=ndots:9", "busybox", "cat", "/etc/resolv.conf")
 
 	// The client will get a warning on stderr when setting DNS to a localhost address; verify this:
-	if !strings.Contains(stderr, "Localhost DNS setting") {
-		c.Fatalf("Expected warning on stderr about localhost resolver, but got %q", stderr)
+	if !strings.Contains(result.Stderr(), "Localhost DNS setting") {
+		c.Fatalf("Expected warning on stderr about localhost resolver, but got %q", result.Stderr())
 	}
 
-	actual := strings.Replace(strings.Trim(out, "\r\n"), "\n", " ", -1)
+	actual := strings.Replace(strings.Trim(result.Stdout(), "\r\n"), "\n", " ", -1)
 	if actual != "search mydomain nameserver 127.0.0.1 options ndots:9" {
 		c.Fatalf("expected 'search mydomain nameserver 127.0.0.1 options ndots:9', but says: %q", actual)
 	}
 
-	out, _ = dockerCmd(c, "run", "--dns=1.1.1.1", "--dns-search=.", "--dns-opt=ndots:3", "busybox", "cat", "/etc/resolv.conf")
+	out := cli.DockerCmd(c, "run", "--dns=1.1.1.1", "--dns-search=.", "--dns-opt=ndots:3", "busybox", "cat", "/etc/resolv.conf").Combined()
 
 	actual = strings.Replace(strings.Trim(strings.Trim(out, "\r\n"), " "), "\n", " ", -1)
 	if actual != "nameserver 1.1.1.1 options ndots:3" {
@@ -1307,7 +1308,7 @@ func (s *DockerSuite) TestRunDNSOptions(c *check.C) {
 
 func (s *DockerSuite) TestRunDNSRepeatOptions(c *check.C) {
 	testRequires(c, DaemonIsLinux)
-	out, _, _ := dockerCmdWithStdoutStderr(c, "run", "--dns=1.1.1.1", "--dns=2.2.2.2", "--dns-search=mydomain", "--dns-search=mydomain2", "--dns-opt=ndots:9", "--dns-opt=timeout:3", "busybox", "cat", "/etc/resolv.conf")
+	out := cli.DockerCmd(c, "run", "--dns=1.1.1.1", "--dns=2.2.2.2", "--dns-search=mydomain", "--dns-search=mydomain2", "--dns-opt=ndots:9", "--dns-opt=timeout:3", "busybox", "cat", "/etc/resolv.conf").Stdout()
 
 	actual := strings.Replace(strings.Trim(out, "\r\n"), "\n", " ", -1)
 	if actual != "search mydomain mydomain2 nameserver 1.1.1.1 nameserver 2.2.2.2 options ndots:9 timeout:3" {
@@ -4093,26 +4094,30 @@ func (s *DockerSuite) TestRunDNSInHostMode(c *check.C) {
 
 	expectedOutput := "nameserver 127.0.0.1"
 	expectedWarning := "Localhost DNS setting"
-	out, stderr, _ := dockerCmdWithStdoutStderr(c, "run", "--dns=127.0.0.1", "--net=host", "busybox", "cat", "/etc/resolv.conf")
-	c.Assert(out, checker.Contains, expectedOutput, check.Commentf("Expected '%s', but got %q", expectedOutput, out))
-	c.Assert(stderr, checker.Contains, expectedWarning, check.Commentf("Expected warning on stderr about localhost resolver, but got %q", stderr))
+	cli.DockerCmd(c, "run", "--dns=127.0.0.1", "--net=host", "busybox", "cat", "/etc/resolv.conf").Assert(c, icmd.Expected{
+		Out: expectedOutput,
+		Err: expectedWarning,
+	})
 
 	expectedOutput = "nameserver 1.2.3.4"
-	out, _ = dockerCmd(c, "run", "--dns=1.2.3.4", "--net=host", "busybox", "cat", "/etc/resolv.conf")
-	c.Assert(out, checker.Contains, expectedOutput, check.Commentf("Expected '%s', but got %q", expectedOutput, out))
+	cli.DockerCmd(c, "run", "--dns=1.2.3.4", "--net=host", "busybox", "cat", "/etc/resolv.conf").Assert(c, icmd.Expected{
+		Out: expectedOutput,
+	})
 
 	expectedOutput = "search example.com"
-	out, _ = dockerCmd(c, "run", "--dns-search=example.com", "--net=host", "busybox", "cat", "/etc/resolv.conf")
-	c.Assert(out, checker.Contains, expectedOutput, check.Commentf("Expected '%s', but got %q", expectedOutput, out))
+	cli.DockerCmd(c, "run", "--dns-search=example.com", "--net=host", "busybox", "cat", "/etc/resolv.conf").Assert(c, icmd.Expected{
+		Out: expectedOutput,
+	})
 
 	expectedOutput = "options timeout:3"
-	out, _ = dockerCmd(c, "run", "--dns-opt=timeout:3", "--net=host", "busybox", "cat", "/etc/resolv.conf")
-	c.Assert(out, checker.Contains, expectedOutput, check.Commentf("Expected '%s', but got %q", expectedOutput, out))
+	cli.DockerCmd(c, "run", "--dns-opt=timeout:3", "--net=host", "busybox", "cat", "/etc/resolv.conf").Assert(c, icmd.Expected{
+		Out: expectedOutput,
+	})
 
 	expectedOutput1 := "nameserver 1.2.3.4"
 	expectedOutput2 := "search example.com"
 	expectedOutput3 := "options timeout:3"
-	out, _ = dockerCmd(c, "run", "--dns=1.2.3.4", "--dns-search=example.com", "--dns-opt=timeout:3", "--net=host", "busybox", "cat", "/etc/resolv.conf")
+	out := cli.DockerCmd(c, "run", "--dns=1.2.3.4", "--dns-search=example.com", "--dns-opt=timeout:3", "--net=host", "busybox", "cat", "/etc/resolv.conf").Combined()
 	c.Assert(out, checker.Contains, expectedOutput1, check.Commentf("Expected '%s', but got %q", expectedOutput1, out))
 	c.Assert(out, checker.Contains, expectedOutput2, check.Commentf("Expected '%s', but got %q", expectedOutput2, out))
 	c.Assert(out, checker.Contains, expectedOutput3, check.Commentf("Expected '%s', but got %q", expectedOutput3, out))
@@ -4139,25 +4144,24 @@ func (s *DockerSuite) TestRunRmAndWait(c *check.C) {
 // Test that auto-remove is performed by the daemon (API 1.25 and above)
 func (s *DockerSuite) TestRunRm(c *check.C) {
 	name := "miss-me-when-im-gone"
-	dockerCmd(c, "run", "--name="+name, "--rm", "busybox")
+	cli.DockerCmd(c, "run", "--name="+name, "--rm", "busybox")
 
-	_, err := inspectFieldWithError(name, "name")
-	c.Assert(err, checker.Not(check.IsNil))
-	c.Assert(err.Error(), checker.Contains, "No such object: "+name)
+	cli.Docker(cli.Inspect(name), cli.Format(".name")).Assert(c, icmd.Expected{
+		ExitCode: 1,
+		Err:      "No such object: " + name,
+	})
 }
 
 // Test that auto-remove is performed by the client on API versions that do not support daemon-side api-remove (API < 1.25)
 func (s *DockerSuite) TestRunRmPre125Api(c *check.C) {
 	name := "miss-me-when-im-gone"
-	result := icmd.RunCmd(icmd.Cmd{
-		Command: binaryWithArgs("run", "--name="+name, "--rm", "busybox"),
-		Env:     appendBaseEnv(false, "DOCKER_API_VERSION=1.24"),
-	})
-	c.Assert(result, icmd.Matches, icmd.Success)
+	envs := appendBaseEnv(false, "DOCKER_API_VERSION=1.24")
+	cli.Docker(cli.Args("run", "--name="+name, "--rm", "busybox"), cli.WithEnvironmentVariables(envs...)).Assert(c, icmd.Success)
 
-	_, err := inspectFieldWithError(name, "name")
-	c.Assert(err, checker.Not(check.IsNil))
-	c.Assert(err.Error(), checker.Contains, "No such object: "+name)
+	cli.Docker(cli.Inspect(name), cli.Format(".name")).Assert(c, icmd.Expected{
+		ExitCode: 1,
+		Err:      "No such object: " + name,
+	})
 }
 
 // Test case for #23498
@@ -4416,6 +4420,184 @@ func (s *DockerSuite) TestRunMountReadOnlyDevShm(c *check.C) {
 		"busybox", "touch", "/dev/shm/foo")
 	c.Assert(err, checker.NotNil, check.Commentf(out))
 	c.Assert(out, checker.Contains, "Read-only file system")
+}
+
+func (s *DockerSuite) TestRunMount(c *check.C) {
+	testRequires(c, DaemonIsLinux, SameHostDaemon, NotUserNamespace)
+
+	// mnt1, mnt2, and testCatFooBar are commonly used in multiple test cases
+	tmpDir, err := ioutil.TempDir("", "mount")
+	if err != nil {
+		c.Fatal(err)
+	}
+	defer os.RemoveAll(tmpDir)
+	mnt1, mnt2 := path.Join(tmpDir, "mnt1"), path.Join(tmpDir, "mnt2")
+	if err := os.Mkdir(mnt1, 0755); err != nil {
+		c.Fatal(err)
+	}
+	if err := os.Mkdir(mnt2, 0755); err != nil {
+		c.Fatal(err)
+	}
+	if err := ioutil.WriteFile(path.Join(mnt1, "test1"), []byte("test1"), 0644); err != nil {
+		c.Fatal(err)
+	}
+	if err := ioutil.WriteFile(path.Join(mnt2, "test2"), []byte("test2"), 0644); err != nil {
+		c.Fatal(err)
+	}
+	testCatFooBar := func(cName string) error {
+		out, _ := dockerCmd(c, "exec", cName, "cat", "/foo/test1")
+		if out != "test1" {
+			return fmt.Errorf("%s not mounted on /foo", mnt1)
+		}
+		out, _ = dockerCmd(c, "exec", cName, "cat", "/bar/test2")
+		if out != "test2" {
+			return fmt.Errorf("%s not mounted on /bar", mnt2)
+		}
+		return nil
+	}
+
+	type testCase struct {
+		equivalents [][]string
+		valid       bool
+		// fn should be nil if valid==false
+		fn func(cName string) error
+	}
+	cases := []testCase{
+		{
+			equivalents: [][]string{
+				{
+					"--mount", fmt.Sprintf("type=bind,src=%s,dst=/foo", mnt1),
+					"--mount", fmt.Sprintf("type=bind,src=%s,dst=/bar", mnt2),
+				},
+				{
+					"--mount", fmt.Sprintf("type=bind,src=%s,dst=/foo", mnt1),
+					"--mount", fmt.Sprintf("type=bind,src=%s,target=/bar", mnt2),
+				},
+				{
+					"--volume", mnt1 + ":/foo",
+					"--mount", fmt.Sprintf("type=bind,src=%s,target=/bar", mnt2),
+				},
+			},
+			valid: true,
+			fn:    testCatFooBar,
+		},
+		{
+			equivalents: [][]string{
+				{
+					"--mount", fmt.Sprintf("type=volume,src=%s,dst=/foo", mnt1),
+					"--mount", fmt.Sprintf("type=volume,src=%s,dst=/bar", mnt2),
+				},
+				{
+					"--mount", fmt.Sprintf("type=volume,src=%s,dst=/foo", mnt1),
+					"--mount", fmt.Sprintf("type=volume,src=%s,target=/bar", mnt2),
+				},
+			},
+			valid: false,
+		},
+		{
+			equivalents: [][]string{
+				{
+					"--mount", fmt.Sprintf("type=bind,src=%s,dst=/foo", mnt1),
+					"--mount", fmt.Sprintf("type=volume,src=%s,dst=/bar", mnt2),
+				},
+				{
+					"--volume", mnt1 + ":/foo",
+					"--mount", fmt.Sprintf("type=volume,src=%s,target=/bar", mnt2),
+				},
+			},
+			valid: false,
+			fn:    testCatFooBar,
+		},
+		{
+			equivalents: [][]string{
+				{
+					"--read-only",
+					"--mount", "type=volume,dst=/bar",
+				},
+			},
+			valid: true,
+			fn: func(cName string) error {
+				_, _, err := dockerCmdWithError("exec", cName, "touch", "/bar/icanwritehere")
+				return err
+			},
+		},
+		{
+			equivalents: [][]string{
+				{
+					"--read-only",
+					"--mount", fmt.Sprintf("type=bind,src=%s,dst=/foo", mnt1),
+					"--mount", "type=volume,dst=/bar",
+				},
+				{
+					"--read-only",
+					"--volume", fmt.Sprintf("%s:/foo", mnt1),
+					"--mount", "type=volume,dst=/bar",
+				},
+			},
+			valid: true,
+			fn: func(cName string) error {
+				out, _ := dockerCmd(c, "exec", cName, "cat", "/foo/test1")
+				if out != "test1" {
+					return fmt.Errorf("%s not mounted on /foo", mnt1)
+				}
+				_, _, err := dockerCmdWithError("exec", cName, "touch", "/bar/icanwritehere")
+				return err
+			},
+		},
+		{
+			equivalents: [][]string{
+				{
+					"--mount", fmt.Sprintf("type=bind,src=%s,dst=/foo", mnt1),
+					"--mount", fmt.Sprintf("type=bind,src=%s,dst=/foo", mnt2),
+				},
+				{
+					"--mount", fmt.Sprintf("type=bind,src=%s,dst=/foo", mnt1),
+					"--mount", fmt.Sprintf("type=bind,src=%s,target=/foo", mnt2),
+				},
+				{
+					"--volume", fmt.Sprintf("%s:/foo", mnt1),
+					"--mount", fmt.Sprintf("type=bind,src=%s,target=/foo", mnt2),
+				},
+			},
+			valid: false,
+		},
+		{
+			equivalents: [][]string{
+				{
+					"--volume", fmt.Sprintf("%s:/foo", mnt1),
+					"--mount", fmt.Sprintf("type=volume,src=%s,target=/foo", mnt2),
+				},
+			},
+			valid: false,
+		},
+		{
+			equivalents: [][]string{
+				{
+					"--mount", "type=volume,target=/foo",
+					"--mount", "type=volume,target=/foo",
+				},
+			},
+			valid: false,
+		},
+	}
+
+	for i, testCase := range cases {
+		for j, opts := range testCase.equivalents {
+			cName := fmt.Sprintf("mount-%d-%d", i, j)
+			_, _, err := dockerCmdWithError(append([]string{"run", "-i", "-d", "--name", cName},
+				append(opts, []string{"busybox", "top"}...)...)...)
+			if testCase.valid {
+				c.Assert(err, check.IsNil,
+					check.Commentf("got error while creating a container with %v (%s)", opts, cName))
+				c.Assert(testCase.fn(cName), check.IsNil,
+					check.Commentf("got error while executing test for %v (%s)", opts, cName))
+				dockerCmd(c, "rm", "-f", cName)
+			} else {
+				c.Assert(err, checker.NotNil,
+					check.Commentf("got nil while creating a container with %v (%s)", opts, cName))
+			}
+		}
+	}
 }
 
 // Test that passing a FQDN as hostname properly sets hostname, and

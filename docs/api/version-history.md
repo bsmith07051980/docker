@@ -22,6 +22,7 @@ keywords: "API, Docker, rcli, REST, documentation"
 * `POST /networks/create` now supports creating the ingress network, by specifying an `Ingress` boolean field. As of now this is supported only when using the overlay network driver.
 * `GET /networks/(name)` now returns an `Ingress` field showing whether the network is the ingress one.
 * `GET /networks/` now supports a `scope` filter to filter networks based on the network mode (`swarm`, `global`, or `local`).
+* `POST /containers/create`, `POST /service/create` and `POST /services/(id or name)/update` now takes the field `StartPeriod` as a part of the `HealthConfig` allowing for specification of a period during which the container should not be considered unhealthy even if health checks do not pass.
 
 ## v1.28 API changes
 
@@ -38,6 +39,7 @@ keywords: "API, Docker, rcli, REST, documentation"
 * `POST /services/create` and `POST /services/(id or name)/update` now accept a `rollback` value for `FailureAction`.
 * `POST /services/create` and `POST /services/(id or name)/update` now accept an optional `RollbackConfig` object which specifies rollback options.
 * `GET /services` now supports a `mode` filter to filter services based on the service mode (either `global` or `replicated`).
+* `POST /containers/(name)/update` now supports updating `NanoCPUs` that represents CPU quota in units of 10<sup>-9</sup> CPUs.
 
 ## v1.27 API changes
 

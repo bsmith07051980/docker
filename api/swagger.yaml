@@ -506,6 +506,9 @@ definitions:
       Retries:
         description: "The number of consecutive failures needed to consider a container as unhealthy. 0 means inherit."
         type: "integer"
+      StartPeriod:
+        description: "Start period for the container to initialize before starting health-retries countdown in nanoseconds. 0 means inherit."
+        type: "integer"
 
   HostConfig:
     description: "Container configuration that depends on the host we are running on"
@@ -754,7 +757,7 @@ definitions:
         default: false
       Env:
         description: |
-          A list of environment variables to set inside the container in the form `["VAR=value", ...]`
+          A list of environment variables to set inside the container in the form `["VAR=value", ...]`. A variable without `=` is removed from the environment, rather than to have an empty value.
         type: "array"
         items:
           type: "string"
@@ -2293,6 +2296,12 @@ definitions:
             description: "The fraction of tasks that may fail during an update before the failure action is invoked, specified as a floating point number between 0 and 1."
             type: "number"
             default: 0
+          Order:
+            description: "The order of operations when rolling out an updated task. Either the old task is shut down before the new task is started, or the new task is started before the old task is shut down."
+            type: "string"
+            enum:
+              - "stop-first"
+              - "start-first"
       RollbackConfig:
         description: "Specification for the rollback strategy of the service."
         type: "object"
@@ -2319,6 +2328,12 @@ definitions:
             description: "The fraction of tasks that may fail during a rollback before the failure action is invoked, specified as a floating point number between 0 and 1."
             type: "number"
             default: 0
+          Order:
+            description: "The order of operations when rolling back a task. Either the old task is shut down before the new task is started, or the new task is started before the old task is shut down."
+            type: "string"
+            enum:
+              - "stop-first"
+              - "start-first"
       Networks:
         description: "Array of network names or IDs to attach the service to."
         type: "array"
@@ -7494,6 +7509,7 @@ paths:
                             DriverConfig: {}
                             Labels:
                               com.example.something: "something-value"
+                      Hosts: ["10.10.10.10 host1", "ABCD:EF01:2345:6789:ABCD:EF01:2345:6789 host2"]
                       User: "33"
                       DNSConfig:
                         Nameservers: ["8.8.8.8"]
@@ -7568,6 +7584,11 @@ paths:
           description: "ID or name of service."
           required: true
           type: "string"
+        - name: "insertDefaults"
+          in: "query"
+          description: "Fill empty fields with default values."
+          type: "boolean"
+          default: false
       tags: ["Service"]
     delete:
       summary: "Delete a service"
@@ -7713,12 +7734,12 @@ paths:
           schema:
             type: "string"
         404:
-          description: "no such container"
+          description: "no such service"
           schema:
             $ref: "#/definitions/ErrorResponse"
           examples:
             application/json:
-              message: "No such container: c2ada9df5af8"
+              message: "No such service: c2ada9df5af8"
         500:
           description: "server error"
           schema:
@@ -7731,11 +7752,11 @@ paths:
         - name: "id"
           in: "path"
           required: true
-          description: "ID or name of the container"
+          description: "ID or name of the service"
           type: "string"
         - name: "details"
           in: "query"
-          description: "Show extra details provided to logs."
+          description: "Show service context and extra details provided to logs."
           type: "boolean"
           default: false
         - name: "follow"
@@ -7948,6 +7969,86 @@ paths:
           required: true
           type: "string"
       tags: ["Task"]
+  /tasks/{id}/logs:
+    get:
+      summary: "Get task logs"
+      description: |
+        Get `stdout` and `stderr` logs from a task.
+
+        **Note**: This endpoint works only for services with the `json-file` or `journald` logging drivers.
+      operationId: "TaskLogs"
+      produces:
+        - "application/vnd.docker.raw-stream"
+        - "application/json"
+      responses:
+        101:
+          description: "logs returned as a stream"
+          schema:
+            type: "string"
+            format: "binary"
+        200:
+          description: "logs returned as a string in response body"
+          schema:
+            type: "string"
+        404:
+          description: "no such task"
+          schema:
+            $ref: "#/definitions/ErrorResponse"
+          examples:
+            application/json:
+              message: "No such task: c2ada9df5af8"
+        500:
+          description: "server error"
+          schema:
+            $ref: "#/definitions/ErrorResponse"
+        503:
+          description: "node is not part of a swarm"
+          schema:
+            $ref: "#/definitions/ErrorResponse"
+      parameters:
+        - name: "id"
+          in: "path"
+          required: true
+          description: "ID of the task"
+          type: "string"
+        - name: "details"
+          in: "query"
+          description: "Show task context and extra details provided to logs."
+          type: "boolean"
+          default: false
+        - name: "follow"
+          in: "query"
+          description: |
+            Return the logs as a stream.
+
+            This will return a `101` HTTP response with a `Connection: upgrade` header, then hijack the HTTP connection to send raw output. For more information about hijacking and the stream format, [see the documentation for the attach endpoint](#operation/ContainerAttach).
+          type: "boolean"
+          default: false
+        - name: "stdout"
+          in: "query"
+          description: "Return logs from `stdout`"
+          type: "boolean"
+          default: false
+        - name: "stderr"
+          in: "query"
+          description: "Return logs from `stderr`"
+          type: "boolean"
+          default: false
+        - name: "since"
+          in: "query"
+          description: "Only return logs since this time, as a UNIX timestamp"
+          type: "integer"
+          default: 0
+        - name: "timestamps"
+          in: "query"
+          description: "Add timestamps to every log line"
+          type: "boolean"
+          default: false
+        - name: "tail"
+          in: "query"
+          description: "Only return this number of log lines from the end of the logs. Specify as an integer or `all` to output all log lines."
+          type: "string"
+          default: "all"
   /secrets:
     get:
       summary: "List secrets"
@@ -7984,6 +8085,9 @@ paths:
           description: |
             A JSON encoded value of the filters (a `map[string][]string`) to process on the secrets list. Available filters:
 
+            - `id=<secret id>`
+            - `label=<key> or label=<key>=value`
+            - `name=<secret name>`
             - `names=<secret name>`
       tags: ["Secret"]
   /secrets/create:

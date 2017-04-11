@@ -674,6 +674,7 @@ func TestFullExample(t *testing.T) {
 			Placement: types.Placement{
 				Constraints: []string{"node=foo"},
 			},
+			EndpointMode: "dnsrr",
 		},
 		Devices:    []string{"/dev/ttyUSB0:/dev/ttyUSB0"},
 		DNS:        []string{"8.8.8.8", "9.9.9.9"},
@@ -909,6 +910,7 @@ func TestFullExample(t *testing.T) {
 			{Source: workingDir + "/static", Target: "/var/www/html", Type: "bind"},
 			{Source: homeDir + "/configs", Target: "/etc/configs/", Type: "bind", ReadOnly: true},
 			{Source: "datavolume", Target: "/var/lib/mysql", Type: "volume"},
+			{Source: workingDir + "/opt", Target: "/opt", Consistency: "cached", Type: "bind"},
 		},
 		WorkingDir: "/code",
 	}
