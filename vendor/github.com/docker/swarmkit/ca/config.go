@@ -50,6 +50,12 @@ const (
 	base36DigestLen = 50
 )
 
+var (
+	// GetCertRetryInterval is how long to wait before retrying a node
+	// certificate or root certificate request.
+	GetCertRetryInterval = 2 * time.Second
+)
+
 // SecurityConfig is used to represent a node's security configuration. It includes information about
 // the RootCA and ServerTLSCreds/ClientTLSCreds transport authenticators to be used for MTLS
 type SecurityConfig struct {
@@ -81,6 +87,39 @@ type SecurityConfig struct {
 type CertificateUpdate struct {
 	Role string
 	Err  error
+}
+
+func validateRootCAAndTLSCert(rootCA *RootCA, externalCARootPool *x509.CertPool, tlsKeyPair *tls.Certificate) error {
+	var (
+		leafCert         *x509.Certificate
+		intermediatePool *x509.CertPool
+	)
+	for i, derBytes := range tlsKeyPair.Certificate {
+		parsed, err := x509.ParseCertificate(derBytes)
+		if err != nil {
+			return errors.Wrap(err, "could not validate new root certificates due to parse error")
+		}
+		if i == 0 {
+			leafCert = parsed
+		} else {
+			if intermediatePool == nil {
+				intermediatePool = x509.NewCertPool()
+			}
+			intermediatePool.AddCert(parsed)
+		}
+	}
+	opts := x509.VerifyOptions{
+		Roots:         rootCA.Pool,
+		Intermediates: intermediatePool,
+	}
+	if _, err := leafCert.Verify(opts); err != nil {
+		return errors.Wrap(err, "new root CA does not match existing TLS credentials")
+	}
+	opts.Roots = externalCARootPool
+	if _, err := leafCert.Verify(opts); err != nil {
+		return errors.Wrap(err, "new external root pool does not match existing TLS credentials")
+	}
+	return nil
 }
 
 // NewSecurityConfig initializes and returns a new SecurityConfig.
@@ -149,8 +188,15 @@ func (s *SecurityConfig) UpdateRootCA(rootCA *RootCA, externalCARootPool *x509.C
 	s.mu.Lock()
 	defer s.mu.Unlock()
 
+	// refuse to update the root CA if the current TLS credentials do not validate against it
+	if err := validateRootCAAndTLSCert(rootCA, externalCARootPool, s.certificate); err != nil {
+		return err
+	}
+
 	s.rootCA = rootCA
 	s.externalCAClientRootPool = externalCARootPool
+	s.externalCA.UpdateRootCA(rootCA)
+
 	return s.updateTLSCredentials(s.certificate, s.issuerInfo)
 }
 
@@ -207,6 +253,13 @@ func (s *SecurityConfig) updateTLSCredentials(certificate *tls.Certificate, issu
 		})
 	}
 	return nil
+}
+
+// UpdateTLSCredentials updates the security config with an updated TLS certificate and issuer info
+func (s *SecurityConfig) UpdateTLSCredentials(certificate *tls.Certificate, issuerInfo *IssuerInfo) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.updateTLSCredentials(certificate, issuerInfo)
 }
 
 // SigningPolicy creates a policy used by the signer to ensure that the only fields
@@ -307,6 +360,12 @@ func DownloadRootCA(ctx context.Context, paths CertPaths, token string, connBrok
 			break
 		}
 		log.G(ctx).WithError(err).Errorf("failed to retrieve remote root CA certificate")
+
+		select {
+		case <-time.After(GetCertRetryInterval):
+		case <-ctx.Done():
+			return RootCA{}, ctx.Err()
+		}
 	}
 	if err != nil {
 		return RootCA{}, err
@@ -385,6 +444,8 @@ type CertificateRequestConfig struct {
 	// NodeCertificateStatusRequestTimeout determines how long to wait for a node
 	// status RPC result.  If not provided (zero value), will default to 5 seconds.
 	NodeCertificateStatusRequestTimeout time.Duration
+	// RetryInterval specifies how long to delay between retries, if non-zero.
+	RetryInterval time.Duration
 }
 
 // CreateSecurityConfig creates a new key and cert for this node, either locally
@@ -400,11 +461,12 @@ func (rootCA RootCA) CreateSecurityConfig(ctx context.Context, krw *KeyReadWrite
 	tlsKeyPair, issuerInfo, err := rootCA.IssueAndSaveNewCertificates(krw, cn, proposedRole, org)
 	switch errors.Cause(err) {
 	case ErrNoValidSigner:
+		config.RetryInterval = GetCertRetryInterval
 		// Request certificate issuance from a remote CA.
 		// Last argument is nil because at this point we don't have any valid TLS creds
 		tlsKeyPair, issuerInfo, err = rootCA.RequestAndSaveNewCertificates(ctx, krw, config)
 		if err != nil {
-			log.G(ctx).WithError(err).Error("failed to request save new certificate")
+			log.G(ctx).WithError(err).Error("failed to request and save new certificate")
 			return nil, err
 		}
 	case nil:
@@ -455,9 +517,7 @@ func RenewTLSConfigNow(ctx context.Context, s *SecurityConfig, connBroker *conne
 		return err
 	}
 
-	s.mu.Lock()
-	defer s.mu.Unlock()
-	return s.updateTLSCredentials(tlsKeyPair, issuerInfo)
+	return s.UpdateTLSCredentials(tlsKeyPair, issuerInfo)
 }
 
 // calculateRandomExpiry returns a random duration between 50% and 80% of the

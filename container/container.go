@@ -7,6 +7,7 @@ import (
 	"net"
 	"os"
 	"path/filepath"
+	"runtime"
 	"strconv"
 	"strings"
 	"sync"
@@ -33,6 +34,7 @@ import (
 	"github.com/docker/docker/pkg/ioutils"
 	"github.com/docker/docker/pkg/signal"
 	"github.com/docker/docker/pkg/symlink"
+	"github.com/docker/docker/pkg/system"
 	"github.com/docker/docker/restartmanager"
 	"github.com/docker/docker/runconfig"
 	"github.com/docker/docker/volume"
@@ -58,9 +60,8 @@ var (
 	errInvalidNetwork  = fmt.Errorf("invalid network settings while building port map info")
 )
 
-// CommonContainer holds the fields for a container which are
-// applicable across all platforms supported by the daemon.
-type CommonContainer struct {
+// Container holds the structure defining a container object.
+type Container struct {
 	StreamConfig *stream.Config
 	// embed for Container to support states directly.
 	*State          `json:"State"` // Needed for Engine API version <= 1.11
@@ -78,6 +79,7 @@ type CommonContainer struct {
 	LogPath         string
 	Name            string
 	Driver          string
+	Platform        string
 	// MountLabel contains the options for the 'mount' command
 	MountLabel             string
 	ProcessLabel           string
@@ -87,28 +89,39 @@ type CommonContainer struct {
 	MountPoints            map[string]*volume.MountPoint
 	HostConfig             *containertypes.HostConfig `json:"-"` // do not serialize the host config in the json, otherwise we'll make the container unportable
 	ExecCommands           *exec.Store                `json:"-"`
-	SecretStore            agentexec.SecretGetter     `json:"-"`
+	DependencyStore        agentexec.DependencyGetter `json:"-"`
 	SecretReferences       []*swarmtypes.SecretReference
+	ConfigReferences       []*swarmtypes.ConfigReference
 	// logDriver for closing
 	LogDriver      logger.Logger  `json:"-"`
 	LogCopier      *logger.Copier `json:"-"`
 	restartManager restartmanager.RestartManager
 	attachContext  *attachContext
+
+	// Fields here are specific to Unix platforms
+	AppArmorProfile string
+	HostnamePath    string
+	HostsPath       string
+	ShmPath         string
+	ResolvConfPath  string
+	SeccompProfile  string
+	NoNewPrivileges bool
+
+	// Fields here are specific to Windows
+	NetworkSharedContainerID string
 }
 
 // NewBaseContainer creates a new container with its
 // basic configuration.
 func NewBaseContainer(id, root string) *Container {
 	return &Container{
-		CommonContainer: CommonContainer{
-			ID:            id,
-			State:         NewState(),
-			ExecCommands:  exec.NewStore(),
-			Root:          root,
-			MountPoints:   make(map[string]*volume.MountPoint),
-			StreamConfig:  stream.NewConfig(),
-			attachContext: &attachContext{},
-		},
+		ID:            id,
+		State:         NewState(),
+		ExecCommands:  exec.NewStore(),
+		Root:          root,
+		MountPoints:   make(map[string]*volume.MountPoint),
+		StreamConfig:  stream.NewConfig(),
+		attachContext: &attachContext{},
 	}
 }
 
@@ -130,6 +143,13 @@ func (container *Container) FromDisk() error {
 	// Load container settings
 	if err := dec.Decode(container); err != nil {
 		return err
+	}
+
+	// Ensure the platform is set if blank. Assume it is the platform of the
+	// host OS if not, to ensure containers created before multiple-platform
+	// support are migrated
+	if container.Platform == "" {
+		container.Platform = runtime.GOOS
 	}
 
 	if err := label.ReserveLabel(container.ProcessLabel); err != nil {
@@ -215,7 +235,7 @@ func (container *Container) WriteHostConfig() error {
 }
 
 // SetupWorkingDirectory sets up the container's working directory as set in container.Config.WorkingDir
-func (container *Container) SetupWorkingDirectory(rootUID, rootGID int) error {
+func (container *Container) SetupWorkingDirectory(rootIDs idtools.IDPair) error {
 	if container.Config.WorkingDir == "" {
 		return nil
 	}
@@ -227,7 +247,7 @@ func (container *Container) SetupWorkingDirectory(rootUID, rootGID int) error {
 		return err
 	}
 
-	if err := idtools.MkdirAllNewAs(pth, 0755, rootUID, rootGID); err != nil {
+	if err := idtools.MkdirAllAndChownNew(pth, 0755, rootIDs); err != nil {
 		pthInfo, err2 := os.Stat(pth)
 		if err2 == nil && pthInfo != nil && !pthInfo.IsDir() {
 			return fmt.Errorf("Cannot mkdir: %s is not a directory", container.Config.WorkingDir)
@@ -400,21 +420,20 @@ func (container *Container) AddMountPointWithVolume(destination string, vol volu
 func (container *Container) UnmountVolumes(volumeEventLog func(name, action string, attributes map[string]string)) error {
 	var errors []string
 	for _, volumeMount := range container.MountPoints {
-		// Check if the mountpoint has an ID, this is currently the best way to tell if it's actually mounted
-		// TODO(cpuguyh83): there should be a better way to handle this
-		if volumeMount.Volume != nil && volumeMount.ID != "" {
-			if err := volumeMount.Volume.Unmount(volumeMount.ID); err != nil {
-				errors = append(errors, err.Error())
-				continue
-			}
-			volumeMount.ID = ""
-
-			attributes := map[string]string{
-				"driver":    volumeMount.Volume.DriverName(),
-				"container": container.ID,
-			}
-			volumeEventLog(volumeMount.Volume.Name(), "unmount", attributes)
+		if volumeMount.Volume == nil {
+			continue
 		}
+
+		if err := volumeMount.Cleanup(); err != nil {
+			errors = append(errors, err.Error())
+			continue
+		}
+
+		attributes := map[string]string{
+			"driver":    volumeMount.Volume.DriverName(),
+			"container": container.ID,
+		}
+		volumeEventLog(volumeMount.Volume.Name(), "unmount", attributes)
 	}
 	if len(errors) > 0 {
 		return fmt.Errorf("error while unmounting volumes for container %s: %s", container.ID, strings.Join(errors, "; "))
@@ -645,7 +664,11 @@ func (container *Container) BuildJoinOptions(n libnetwork.Network) ([]libnetwork
 			}
 			joinOptions = append(joinOptions, libnetwork.CreateOptionAlias(name, alias))
 		}
+		for k, v := range epConfig.DriverOpts {
+			joinOptions = append(joinOptions, libnetwork.EndpointOptionGeneric(options.Generic{k: v}))
+		}
 	}
+
 	return joinOptions, nil
 }
 
@@ -743,6 +766,10 @@ func (container *Container) BuildCreateEndpointOptions(n libnetwork.Network, epC
 
 			createOptions = append(createOptions, libnetwork.EndpointOptionGeneric(genericOption))
 		}
+		for k, v := range epConfig.DriverOpts {
+			createOptions = append(createOptions, libnetwork.EndpointOptionGeneric(options.Generic{k: v}))
+		}
+
 	}
 
 	// Port-mapping rules belong to the container & applicable only to non-internal networks
@@ -948,4 +975,61 @@ func (container *Container) InitializeStdio(iop libcontainerd.IOPipe) error {
 	}
 
 	return nil
+}
+
+// SecretMountPath returns the path of the secret mount for the container
+func (container *Container) SecretMountPath() string {
+	return filepath.Join(container.Root, "secrets")
+}
+
+// SecretFilePath returns the path to the location of a secret on the host.
+func (container *Container) SecretFilePath(secretRef swarmtypes.SecretReference) string {
+	return filepath.Join(container.SecretMountPath(), secretRef.SecretID)
+}
+
+func getSecretTargetPath(r *swarmtypes.SecretReference) string {
+	if filepath.IsAbs(r.File.Name) {
+		return r.File.Name
+	}
+
+	return filepath.Join(containerSecretMountPath, r.File.Name)
+}
+
+// ConfigsDirPath returns the path to the directory where configs are stored on
+// disk.
+func (container *Container) ConfigsDirPath() string {
+	return filepath.Join(container.Root, "configs")
+}
+
+// ConfigFilePath returns the path to the on-disk location of a config.
+func (container *Container) ConfigFilePath(configRef swarmtypes.ConfigReference) string {
+	return filepath.Join(container.ConfigsDirPath(), configRef.ConfigID)
+}
+
+// CreateDaemonEnvironment creates a new environment variable slice for this container.
+func (container *Container) CreateDaemonEnvironment(tty bool, linkedEnv []string) []string {
+	// Setup environment
+	// TODO @jhowardmsft LCOW Support. This will need revisiting later.
+	platform := container.Platform
+	if platform == "" {
+		platform = runtime.GOOS
+	}
+	env := []string{}
+	if runtime.GOOS != "windows" || (runtime.GOOS == "windows" && system.LCOWSupported() && platform == "linux") {
+		env = []string{
+			"PATH=" + system.DefaultPathEnv(platform),
+			"HOSTNAME=" + container.Config.Hostname,
+		}
+		if tty {
+			env = append(env, "TERM=xterm")
+		}
+		env = append(env, linkedEnv...)
+	}
+
+	// because the env on the container can override certain default values
+	// we need to replace the 'env' keys where they match and append anything
+	// else.
+	//return ReplaceOrAppendEnvValues(linkedEnv, container.Config.Env)
+	foo := ReplaceOrAppendEnvValues(env, container.Config.Env)
+	return foo
 }

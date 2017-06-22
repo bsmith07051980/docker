@@ -1,12 +1,11 @@
 package main
 
 import (
+	"context"
 	"crypto/tls"
 	"fmt"
-	"io"
 	"os"
 	"path/filepath"
-	"runtime"
 	"strings"
 	"time"
 
@@ -20,15 +19,14 @@ import (
 	"github.com/docker/docker/api/server/router/build"
 	checkpointrouter "github.com/docker/docker/api/server/router/checkpoint"
 	"github.com/docker/docker/api/server/router/container"
+	distributionrouter "github.com/docker/docker/api/server/router/distribution"
 	"github.com/docker/docker/api/server/router/image"
 	"github.com/docker/docker/api/server/router/network"
 	pluginrouter "github.com/docker/docker/api/server/router/plugin"
 	swarmrouter "github.com/docker/docker/api/server/router/swarm"
 	systemrouter "github.com/docker/docker/api/server/router/system"
 	"github.com/docker/docker/api/server/router/volume"
-	"github.com/docker/docker/cli"
 	"github.com/docker/docker/cli/debug"
-	cliflags "github.com/docker/docker/cli/flags"
 	"github.com/docker/docker/daemon"
 	"github.com/docker/docker/daemon/cluster"
 	"github.com/docker/docker/daemon/config"
@@ -47,6 +45,7 @@ import (
 	"github.com/docker/docker/registry"
 	"github.com/docker/docker/runconfig"
 	"github.com/docker/go-connections/tlsconfig"
+	swarmapi "github.com/docker/swarmkit/api"
 	"github.com/spf13/pflag"
 )
 
@@ -66,72 +65,20 @@ func NewDaemonCli() *DaemonCli {
 	return &DaemonCli{}
 }
 
-func migrateKey(config *config.Config) (err error) {
-	// No migration necessary on Windows
-	if runtime.GOOS == "windows" {
-		return nil
-	}
-
-	// Migrate trust key if exists at ~/.docker/key.json and owned by current user
-	oldPath := filepath.Join(cli.ConfigurationDir(), cliflags.DefaultTrustKeyFile)
-	newPath := filepath.Join(getDaemonConfDir(config.Root), cliflags.DefaultTrustKeyFile)
-	if _, statErr := os.Stat(newPath); os.IsNotExist(statErr) && currentUserIsOwner(oldPath) {
-		defer func() {
-			// Ensure old path is removed if no error occurred
-			if err == nil {
-				err = os.Remove(oldPath)
-			} else {
-				logrus.Warnf("Key migration failed, key file not removed at %s", oldPath)
-				os.Remove(newPath)
-			}
-		}()
-
-		if err := system.MkdirAll(getDaemonConfDir(config.Root), os.FileMode(0644)); err != nil {
-			return fmt.Errorf("Unable to create daemon configuration directory: %s", err)
-		}
-
-		newFile, err := os.OpenFile(newPath, os.O_RDWR|os.O_CREATE|os.O_TRUNC, 0600)
-		if err != nil {
-			return fmt.Errorf("error creating key file %q: %s", newPath, err)
-		}
-		defer newFile.Close()
-
-		oldFile, err := os.Open(oldPath)
-		if err != nil {
-			return fmt.Errorf("error opening key file %q: %s", oldPath, err)
-		}
-		defer oldFile.Close()
-
-		if _, err := io.Copy(newFile, oldFile); err != nil {
-			return fmt.Errorf("error copying key: %s", err)
-		}
-
-		logrus.Infof("Migrated key from %s to %s", oldPath, newPath)
-	}
-
-	return nil
-}
-
-func (cli *DaemonCli) start(opts daemonOptions) (err error) {
+func (cli *DaemonCli) start(opts *daemonOptions) (err error) {
 	stopc := make(chan bool)
 	defer close(stopc)
 
 	// warn from uuid package when running the daemon
 	uuid.Loggerf = logrus.Warnf
 
-	opts.common.SetDefaultOptions(opts.flags)
+	opts.SetDefaultOptions(opts.flags)
 
 	if cli.Config, err = loadDaemonCliConfig(opts); err != nil {
 		return err
 	}
 	cli.configFile = &opts.configFile
 	cli.flags = opts.flags
-
-	if opts.common.TrustKey == "" {
-		opts.common.TrustKey = filepath.Join(
-			getDaemonConfDir(cli.Config.Root),
-			cliflags.DefaultTrustKeyFile)
-	}
 
 	if cli.Config.Debug {
 		debug.Enable()
@@ -184,9 +131,10 @@ func (cli *DaemonCli) start(opts daemonOptions) (err error) {
 
 	if cli.Config.TLS {
 		tlsOptions := tlsconfig.Options{
-			CAFile:   cli.Config.CommonTLSOptions.CAFile,
-			CertFile: cli.Config.CommonTLSOptions.CertFile,
-			KeyFile:  cli.Config.CommonTLSOptions.KeyFile,
+			CAFile:             cli.Config.CommonTLSOptions.CAFile,
+			CertFile:           cli.Config.CommonTLSOptions.CertFile,
+			KeyFile:            cli.Config.CommonTLSOptions.KeyFile,
+			ExclusiveRootPools: true,
 		}
 
 		if cli.Config.TLSVerify {
@@ -206,6 +154,8 @@ func (cli *DaemonCli) start(opts daemonOptions) (err error) {
 
 	api := apiserver.New(serverConfig)
 	cli.api = api
+
+	var hosts []string
 
 	for i := 0; i < len(cli.Config.Hosts); i++ {
 		var err error
@@ -238,15 +188,9 @@ func (cli *DaemonCli) start(opts daemonOptions) (err error) {
 			}
 		}
 		logrus.Debugf("Listener created for HTTP on %s (%s)", proto, addr)
+		hosts = append(hosts, protoAddrParts[1])
 		api.Accept(addr, ls...)
 	}
-
-	if err := migrateKey(cli.Config); err != nil {
-		return err
-	}
-
-	// FIXME: why is this down here instead of with the other TrustKey logic above?
-	cli.TrustKeyPath = opts.common.TrustKey
 
 	registryService := registry.NewService(cli.Config.ServiceOptions)
 	containerdRemote, err := libcontainerd.New(cli.getLibcontainerdRoot(), cli.getPlatformRemoteOptions()...)
@@ -267,10 +211,16 @@ func (cli *DaemonCli) start(opts daemonOptions) (err error) {
 		logrus.Fatalf("Error creating middlewares: %v", err)
 	}
 
+	if system.LCOWSupported() {
+		logrus.Warnln("LCOW support is enabled - this feature is incomplete")
+	}
+
 	d, err := daemon.NewDaemon(cli.Config, registryService, containerdRemote, pluginStore)
 	if err != nil {
 		return fmt.Errorf("Error starting daemon: %v", err)
 	}
+
+	d.StoreHosts(hosts)
 
 	// validate after NewDaemon has restored enabled plugins. Dont change order.
 	if err := validateAuthzPlugins(cli.Config.AuthorizationPlugins, pluginStore); err != nil {
@@ -288,6 +238,10 @@ func (cli *DaemonCli) start(opts daemonOptions) (err error) {
 
 	name, _ := os.Hostname()
 
+	// Use a buffered channel to pass changes from store watch API to daemon
+	// A buffer allows store watch API and daemon processing to not wait for each other
+	watchStream := make(chan *swarmapi.WatchMessage, 32)
+
 	c, err := cluster.New(cluster.Config{
 		Root:                   cli.Config.Root,
 		Name:                   name,
@@ -295,9 +249,15 @@ func (cli *DaemonCli) start(opts daemonOptions) (err error) {
 		NetworkSubnetsProvider: d,
 		DefaultAdvertiseAddr:   cli.Config.SwarmDefaultAdvertiseAddr,
 		RuntimeRoot:            cli.getSwarmRunRoot(),
+		WatchStream:            watchStream,
 	})
 	if err != nil {
 		logrus.Fatalf("Error creating cluster component: %v", err)
+	}
+	d.SetCluster(c)
+	err = c.Start()
+	if err != nil {
+		logrus.Fatalf("Error starting cluster component: %v", err)
 	}
 
 	// Restart all autostart containers which has a swarm endpoint
@@ -307,16 +267,14 @@ func (cli *DaemonCli) start(opts daemonOptions) (err error) {
 
 	logrus.Info("Daemon has completed initialization")
 
-	logrus.WithFields(logrus.Fields{
-		"version":     dockerversion.Version,
-		"commit":      dockerversion.GitCommit,
-		"graphdriver": d.GraphDriverName(),
-	}).Info("Docker daemon")
-
 	cli.d = d
 
-	d.SetCluster(c)
 	initRouter(api, d, c)
+
+	// process cluster change notifications
+	watchCtx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	go d.ProcessClusterNotifications(watchCtx, watchStream)
 
 	cli.setupConfigReloadTrap()
 
@@ -403,20 +361,26 @@ func shutdownDaemon(d *daemon.Daemon) {
 	}
 }
 
-func loadDaemonCliConfig(opts daemonOptions) (*config.Config, error) {
+func loadDaemonCliConfig(opts *daemonOptions) (*config.Config, error) {
 	conf := opts.daemonConfig
 	flags := opts.flags
-	conf.Debug = opts.common.Debug
-	conf.Hosts = opts.common.Hosts
-	conf.LogLevel = opts.common.LogLevel
-	conf.TLS = opts.common.TLS
-	conf.TLSVerify = opts.common.TLSVerify
+	conf.Debug = opts.Debug
+	conf.Hosts = opts.Hosts
+	conf.LogLevel = opts.LogLevel
+	conf.TLS = opts.TLS
+	conf.TLSVerify = opts.TLSVerify
 	conf.CommonTLSOptions = config.CommonTLSOptions{}
 
-	if opts.common.TLSOptions != nil {
-		conf.CommonTLSOptions.CAFile = opts.common.TLSOptions.CAFile
-		conf.CommonTLSOptions.CertFile = opts.common.TLSOptions.CertFile
-		conf.CommonTLSOptions.KeyFile = opts.common.TLSOptions.KeyFile
+	if opts.TLSOptions != nil {
+		conf.CommonTLSOptions.CAFile = opts.TLSOptions.CAFile
+		conf.CommonTLSOptions.CertFile = opts.TLSOptions.CertFile
+		conf.CommonTLSOptions.KeyFile = opts.TLSOptions.KeyFile
+	}
+
+	if conf.TrustKeyPath == "" {
+		conf.TrustKeyPath = filepath.Join(
+			getDaemonConfDir(conf.Root),
+			defaultTrustKeyFile)
 	}
 
 	if flags.Changed("graph") && flags.Changed("data-root") {
@@ -441,8 +405,12 @@ func loadDaemonCliConfig(opts daemonOptions) (*config.Config, error) {
 		return nil, err
 	}
 
+	if conf.V2Only == false {
+		logrus.Warnf(`The "disable-legacy-registry" option is deprecated and wil be removed in Docker v17.12. Interacting with legacy (v1) registries will no longer be supported in Docker v17.12"`)
+	}
+
 	if flags.Changed("graph") {
-		logrus.Warnf(`the "-g / --graph" flag is deprecated. Please use "--data-root" instead`)
+		logrus.Warnf(`The "-g / --graph" flag is deprecated. Please use "--data-root" instead`)
 	}
 
 	// Labels of the docker engine used to allow multiple values associated with the same key.
@@ -464,12 +432,12 @@ func loadDaemonCliConfig(opts daemonOptions) (*config.Config, error) {
 
 	// Regardless of whether the user sets it to true or false, if they
 	// specify TLSVerify at all then we need to turn on TLS
-	if conf.IsValueSet(cliflags.FlagTLSVerify) {
+	if conf.IsValueSet(FlagTLSVerify) {
 		conf.TLS = true
 	}
 
 	// ensure that the log level is the one set after merging configurations
-	cliflags.SetLogLevel(conf.LogLevel)
+	setLogLevel(conf.LogLevel)
 
 	return conf, nil
 }
@@ -484,9 +452,10 @@ func initRouter(s *apiserver.Server, d *daemon.Daemon, c *cluster.Cluster) {
 		image.NewRouter(d, decoder),
 		systemrouter.NewRouter(d, c),
 		volume.NewRouter(d),
-		build.NewRouter(buildbackend.NewBackend(d, d), d),
+		build.NewRouter(buildbackend.NewBackend(d, d, d.IDMappings()), d),
 		swarmrouter.NewRouter(c),
 		pluginrouter.NewRouter(d.PluginManager()),
+		distributionrouter.NewRouter(d),
 	}
 
 	if d.NetworkControllerEnabled() {

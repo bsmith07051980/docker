@@ -178,6 +178,10 @@ type ImageBuildOptions struct {
 	SecurityOpt []string
 	ExtraHosts  []string // List of extra hosts
 	Target      string
+
+	// TODO @jhowardmsft LCOW Support: This will require extending to include
+	// `Platform string`, but is ommited for now as it's hard-coded temporarily
+	// to avoid API changes.
 }
 
 // ImageBuildResponse holds information
@@ -276,6 +280,12 @@ type ServiceCreateOptions struct {
 	//
 	// This field follows the format of the X-Registry-Auth header.
 	EncodedRegistryAuth string
+
+	// QueryRegistry indicates whether the service update requires
+	// contacting a registry. A registry may be contacted to retrieve
+	// the image digest and manifest, which in turn can be used to update
+	// platform or other information about the service.
+	QueryRegistry bool
 }
 
 // ServiceCreateResponse contains the information returned to a client
@@ -315,6 +325,12 @@ type ServiceUpdateOptions struct {
 	// The valid values are "previous" and "none". An empty value is the
 	// same as "none".
 	Rollback string
+
+	// QueryRegistry indicates whether the service update requires
+	// contacting a registry. A registry may be contacted to retrieve
+	// the image digest and manifest, which in turn can be used to update
+	// platform or other information about the service.
+	QueryRegistry bool
 }
 
 // ServiceListOptions holds parameters to list services with.

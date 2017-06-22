@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"io"
 	"io/ioutil"
+	"runtime"
 	"strings"
 
 	"github.com/Sirupsen/logrus"
@@ -15,8 +16,12 @@ import (
 	"github.com/docker/docker/builder/dockerfile/command"
 	"github.com/docker/docker/builder/dockerfile/parser"
 	"github.com/docker/docker/builder/remotecontext"
+	"github.com/docker/docker/pkg/archive"
+	"github.com/docker/docker/pkg/chrootarchive"
+	"github.com/docker/docker/pkg/idtools"
 	"github.com/docker/docker/pkg/streamformatter"
 	"github.com/docker/docker/pkg/stringid"
+	"github.com/docker/docker/pkg/system"
 	"github.com/pkg/errors"
 	"golang.org/x/net/context"
 	"golang.org/x/sync/syncmap"
@@ -35,21 +40,25 @@ var validCommitCommands = map[string]bool{
 	"workdir":     true,
 }
 
-var defaultLogConfig = container.LogConfig{Type: "none"}
-
 // BuildManager is shared across all Builder objects
 type BuildManager struct {
+	archiver  *archive.Archiver
 	backend   builder.Backend
 	pathCache pathCache // TODO: make this persistent
 }
 
 // NewBuildManager creates a BuildManager
-func NewBuildManager(b builder.Backend) *BuildManager {
-	return &BuildManager{backend: b, pathCache: &syncmap.Map{}}
+func NewBuildManager(b builder.Backend, idMappings *idtools.IDMappings) *BuildManager {
+	return &BuildManager{
+		backend:   b,
+		pathCache: &syncmap.Map{},
+		archiver:  chrootarchive.NewArchiver(idMappings),
+	}
 }
 
 // Build starts a new build from a BuildConfig
 func (bm *BuildManager) Build(ctx context.Context, config backend.BuildConfig) (*builder.Result, error) {
+	buildsTriggered.Inc()
 	if config.Options.Dockerfile == "" {
 		config.Options.Dockerfile = builder.DefaultDockerfileName
 	}
@@ -66,12 +75,24 @@ func (bm *BuildManager) Build(ctx context.Context, config backend.BuildConfig) (
 		}()
 	}
 
+	// TODO @jhowardmsft LCOW support - this will require rework to allow both linux and Windows simultaneously.
+	// This is an interim solution to hardcode to linux if LCOW is turned on.
+	if dockerfile.Platform == "" {
+		dockerfile.Platform = runtime.GOOS
+		if dockerfile.Platform == "windows" && system.LCOWSupported() {
+			dockerfile.Platform = "linux"
+		}
+	}
+
 	builderOptions := builderOptions{
 		Options:        config.Options,
 		ProgressWriter: config.ProgressWriter,
 		Backend:        bm.backend,
 		PathCache:      bm.pathCache,
+		Archiver:       bm.archiver,
+		Platform:       dockerfile.Platform,
 	}
+
 	return newBuilder(ctx, builderOptions).build(source, dockerfile)
 }
 
@@ -81,6 +102,8 @@ type builderOptions struct {
 	Backend        builder.Backend
 	ProgressWriter backend.ProgressWriter
 	PathCache      pathCache
+	Archiver       *archive.Archiver
+	Platform       string
 }
 
 // Builder is a Dockerfile builder
@@ -94,71 +117,89 @@ type Builder struct {
 	Output io.Writer
 
 	docker    builder.Backend
-	source    builder.Source
 	clientCtx context.Context
 
-	tmpContainers map[string]struct{}
-	imageContexts *imageContexts // helper for storing contexts from builds
-	disableCommit bool
-	cacheBusted   bool
-	buildArgs     *buildArgs
-	imageCache    builder.ImageCache
+	archiver         *archive.Archiver
+	buildStages      *buildStages
+	disableCommit    bool
+	buildArgs        *buildArgs
+	imageSources     *imageSources
+	pathCache        pathCache
+	containerManager *containerManager
+	imageProber      ImageProber
+
+	// TODO @jhowardmft LCOW Support. This will be moved to options at a later
+	// stage, however that cannot be done now as it affects the public API
+	// if it were.
+	platform string
 }
 
 // newBuilder creates a new Dockerfile builder from an optional dockerfile and a Options.
+// TODO @jhowardmsft LCOW support: Eventually platform can be moved into the builder
+// options, however, that would be an API change as it shares types.ImageBuildOptions.
 func newBuilder(clientCtx context.Context, options builderOptions) *Builder {
 	config := options.Options
 	if config == nil {
 		config = new(types.ImageBuildOptions)
 	}
-	b := &Builder{
-		clientCtx:     clientCtx,
-		options:       config,
-		Stdout:        options.ProgressWriter.StdoutFormatter,
-		Stderr:        options.ProgressWriter.StderrFormatter,
-		Aux:           options.ProgressWriter.AuxFormatter,
-		Output:        options.ProgressWriter.Output,
-		docker:        options.Backend,
-		tmpContainers: map[string]struct{}{},
-		buildArgs:     newBuildArgs(config.BuildArgs),
-	}
-	b.imageContexts = &imageContexts{b: b, cache: options.PathCache}
-	return b
-}
 
-func (b *Builder) resetImageCache() {
-	if icb, ok := b.docker.(builder.ImageCacheBuilder); ok {
-		b.imageCache = icb.MakeImageCache(b.options.CacheFrom)
+	// @jhowardmsft LCOW Support. For the time being, this is interim. Eventually
+	// will be moved to types.ImageBuildOptions, but it can't for now as that would
+	// be an API change.
+	if options.Platform == "" {
+		options.Platform = runtime.GOOS
 	}
-	b.cacheBusted = false
+	if options.Platform == "windows" && system.LCOWSupported() {
+		options.Platform = "linux"
+	}
+
+	b := &Builder{
+		clientCtx:        clientCtx,
+		options:          config,
+		Stdout:           options.ProgressWriter.StdoutFormatter,
+		Stderr:           options.ProgressWriter.StderrFormatter,
+		Aux:              options.ProgressWriter.AuxFormatter,
+		Output:           options.ProgressWriter.Output,
+		docker:           options.Backend,
+		archiver:         options.Archiver,
+		buildArgs:        newBuildArgs(config.BuildArgs),
+		buildStages:      newBuildStages(),
+		imageSources:     newImageSources(clientCtx, options),
+		pathCache:        options.PathCache,
+		imageProber:      newImageProber(options.Backend, config.CacheFrom, options.Platform, config.NoCache),
+		containerManager: newContainerManager(options.Backend),
+		platform:         options.Platform,
+	}
+
+	return b
 }
 
 // Build runs the Dockerfile builder by parsing the Dockerfile and executing
 // the instructions from the file.
 func (b *Builder) build(source builder.Source, dockerfile *parser.Result) (*builder.Result, error) {
-	defer b.imageContexts.unmount()
-
-	// TODO: Remove source field from Builder
-	b.source = source
+	defer b.imageSources.Unmount()
 
 	addNodesForLabelOption(dockerfile.AST, b.options.Labels)
 
 	if err := checkDispatchDockerfile(dockerfile.AST); err != nil {
+		buildsFailed.WithValues(metricsDockerfileSyntaxError).Inc()
 		return nil, err
 	}
 
-	dispatchState, err := b.dispatchDockerfileWithCancellation(dockerfile)
+	dispatchState, err := b.dispatchDockerfileWithCancellation(dockerfile, source)
 	if err != nil {
 		return nil, err
 	}
 
 	if b.options.Target != "" && !dispatchState.isCurrentStage(b.options.Target) {
+		buildsFailed.WithValues(metricsBuildTargetNotReachableError).Inc()
 		return nil, errors.Errorf("failed to reach build target %s in Dockerfile", b.options.Target)
 	}
 
-	b.warnOnUnusedBuildArgs()
+	b.buildArgs.WarnOnUnusedBuildArgs(b.Stderr)
 
 	if dispatchState.imageID == "" {
+		buildsFailed.WithValues(metricsDockerfileEmptyError).Inc()
 		return nil, errors.New("No image was generated. Is your Dockerfile empty?")
 	}
 	return &builder.Result{ImageID: dispatchState.imageID, FromImage: dispatchState.baseImage}, nil
@@ -171,7 +212,7 @@ func emitImageID(aux *streamformatter.AuxFormatter, state *dispatchState) error 
 	return aux.Emit(types.BuildResult{ID: state.imageID})
 }
 
-func (b *Builder) dispatchDockerfileWithCancellation(dockerfile *parser.Result) (*dispatchState, error) {
+func (b *Builder) dispatchDockerfileWithCancellation(dockerfile *parser.Result, source builder.Source) (*dispatchState, error) {
 	shlex := NewShellLex(dockerfile.EscapeToken)
 	state := newDispatchState()
 	total := len(dockerfile.AST.Children)
@@ -181,6 +222,7 @@ func (b *Builder) dispatchDockerfileWithCancellation(dockerfile *parser.Result) 
 		case <-b.clientCtx.Done():
 			logrus.Debug("Builder: build cancelled!")
 			fmt.Fprint(b.Stdout, "Build cancelled")
+			buildsFailed.WithValues(metricsBuildCanceled).Inc()
 			return nil, errors.New("Build cancelled")
 		default:
 			// Not cancelled yet, keep going...
@@ -204,17 +246,18 @@ func (b *Builder) dispatchDockerfileWithCancellation(dockerfile *parser.Result) 
 			stepMsg: formatStep(i, total),
 			node:    n,
 			shlex:   shlex,
+			source:  source,
 		}
 		if state, err = b.dispatch(opts); err != nil {
 			if b.options.ForceRemove {
-				b.clearTmp()
+				b.containerManager.RemoveAll(b.Stdout)
 			}
 			return nil, err
 		}
 
 		fmt.Fprintf(b.Stdout, " ---> %s\n", stringid.TruncateID(state.imageID))
 		if b.options.Remove {
-			b.clearTmp()
+			b.containerManager.RemoveAll(b.Stdout)
 		}
 	}
 
@@ -235,15 +278,6 @@ func addNodesForLabelOption(dockerfile *parser.Node, labels map[string]string) {
 	dockerfile.Children = append(dockerfile.Children, node)
 }
 
-// check if there are any leftover build-args that were passed but not
-// consumed during build. Print a warning, if there are any.
-func (b *Builder) warnOnUnusedBuildArgs() {
-	leftoverArgs := b.buildArgs.UnreferencedOptionArgs()
-	if len(leftoverArgs) > 0 {
-		fmt.Fprintf(b.Stderr, "[Warning] One or more build-args %v were not consumed\n", leftoverArgs)
-	}
-}
-
 // BuildFromConfig builds directly from `changes`, treating it as if it were the contents of a Dockerfile
 // It will:
 // - Call parse.Parse() to get an AST root for the concatenated Dockerfile entries.
@@ -258,12 +292,25 @@ func BuildFromConfig(config *container.Config, changes []string) (*container.Con
 		return config, nil
 	}
 
-	b := newBuilder(context.Background(), builderOptions{})
+	b := newBuilder(context.Background(), builderOptions{
+		Options: &types.ImageBuildOptions{NoCache: true},
+	})
 
 	dockerfile, err := parser.Parse(bytes.NewBufferString(strings.Join(changes, "\n")))
 	if err != nil {
 		return nil, err
 	}
+
+	// TODO @jhowardmsft LCOW support. For now, if LCOW enabled, switch to linux.
+	// Also explicitly set the platform. Ultimately this will be in the builder
+	// options, but we can't do that yet as it would change the API.
+	if dockerfile.Platform == "" {
+		dockerfile.Platform = runtime.GOOS
+	}
+	if dockerfile.Platform == "windows" && system.LCOWSupported() {
+		dockerfile.Platform = "linux"
+	}
+	b.platform = dockerfile.Platform
 
 	// ensure that the commands are valid
 	for _, n := range dockerfile.AST.Children {
@@ -281,7 +328,7 @@ func BuildFromConfig(config *container.Config, changes []string) (*container.Con
 	}
 	dispatchState := newDispatchState()
 	dispatchState.runConfig = config
-	return dispatchFromDockerfile(b, dockerfile, dispatchState)
+	return dispatchFromDockerfile(b, dockerfile, dispatchState, nil)
 }
 
 func checkDispatchDockerfile(dockerfile *parser.Node) error {
@@ -293,7 +340,7 @@ func checkDispatchDockerfile(dockerfile *parser.Node) error {
 	return nil
 }
 
-func dispatchFromDockerfile(b *Builder, result *parser.Result, dispatchState *dispatchState) (*container.Config, error) {
+func dispatchFromDockerfile(b *Builder, result *parser.Result, dispatchState *dispatchState, source builder.Source) (*container.Config, error) {
 	shlex := NewShellLex(result.EscapeToken)
 	ast := result.AST
 	total := len(ast.Children)
@@ -304,6 +351,7 @@ func dispatchFromDockerfile(b *Builder, result *parser.Result, dispatchState *di
 			stepMsg: formatStep(i, total),
 			node:    n,
 			shlex:   shlex,
+			source:  source,
 		}
 		if _, err := b.dispatch(opts); err != nil {
 			return nil, err

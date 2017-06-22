@@ -3,11 +3,15 @@ package main
 import (
 	"archive/tar"
 	"bytes"
+	"encoding/json"
+	"fmt"
+	"io"
 	"io/ioutil"
 	"net/http"
 	"regexp"
 	"strings"
 
+	"github.com/docker/docker/api/types"
 	"github.com/docker/docker/integration-cli/checker"
 	"github.com/docker/docker/integration-cli/cli/build/fakecontext"
 	"github.com/docker/docker/integration-cli/cli/build/fakegit"
@@ -15,6 +19,9 @@ import (
 	"github.com/docker/docker/integration-cli/request"
 	"github.com/docker/docker/pkg/testutil"
 	"github.com/go-check/check"
+	"github.com/stretchr/testify/assert"
+	"github.com/stretchr/testify/require"
+	"golang.org/x/net/context"
 )
 
 func (s *DockerSuite) TestBuildAPIDockerFileRemote(c *check.C) {
@@ -248,4 +255,132 @@ func (s *DockerSuite) TestBuildAPIUnnormalizedTarPaths(c *check.C) {
 	imageB := buildFromTarContext([]byte("def"))
 
 	c.Assert(imageA, checker.Not(checker.Equals), imageB)
+}
+
+func (s *DockerSuite) TestBuildOnBuildWithCopy(c *check.C) {
+	dockerfile := `
+		FROM ` + minimalBaseImage() + ` as onbuildbase
+		ONBUILD COPY file /file
+
+		FROM onbuildbase
+	`
+	ctx := fakecontext.New(c, "",
+		fakecontext.WithDockerfile(dockerfile),
+		fakecontext.WithFile("file", "some content"),
+	)
+	defer ctx.Close()
+
+	res, body, err := request.Post(
+		"/build",
+		request.RawContent(ctx.AsTarReader(c)),
+		request.ContentType("application/x-tar"))
+	c.Assert(err, checker.IsNil)
+	c.Assert(res.StatusCode, checker.Equals, http.StatusOK)
+
+	out, err := testutil.ReadBody(body)
+	c.Assert(err, checker.IsNil)
+	c.Assert(string(out), checker.Contains, "Successfully built")
+}
+
+func (s *DockerSuite) TestBuildOnBuildCache(c *check.C) {
+	build := func(dockerfile string) []byte {
+		ctx := fakecontext.New(c, "",
+			fakecontext.WithDockerfile(dockerfile),
+		)
+		defer ctx.Close()
+
+		res, body, err := request.Post(
+			"/build",
+			request.RawContent(ctx.AsTarReader(c)),
+			request.ContentType("application/x-tar"))
+		require.NoError(c, err)
+		assert.Equal(c, http.StatusOK, res.StatusCode)
+
+		out, err := testutil.ReadBody(body)
+		require.NoError(c, err)
+		assert.Contains(c, string(out), "Successfully built")
+		return out
+	}
+
+	dockerfile := `
+		FROM ` + minimalBaseImage() + ` as onbuildbase
+		ENV something=bar
+		ONBUILD ENV foo=bar
+	`
+	build(dockerfile)
+
+	dockerfile += "FROM onbuildbase"
+	out := build(dockerfile)
+
+	imageIDs := getImageIDsFromBuild(c, out)
+	assert.Len(c, imageIDs, 2)
+	parentID, childID := imageIDs[0], imageIDs[1]
+
+	client, err := request.NewClient()
+	require.NoError(c, err)
+
+	// check parentID is correct
+	image, _, err := client.ImageInspectWithRaw(context.Background(), childID)
+	require.NoError(c, err)
+	assert.Equal(c, parentID, image.Parent)
+}
+
+func (s *DockerRegistrySuite) TestBuildCopyFromForcePull(c *check.C) {
+	client, err := request.NewClient()
+	require.NoError(c, err)
+
+	repoName := fmt.Sprintf("%v/dockercli/busybox", privateRegistryURL)
+	// tag the image to upload it to the private registry
+	err = client.ImageTag(context.TODO(), "busybox", repoName)
+	assert.Nil(c, err)
+	// push the image to the registry
+	rc, err := client.ImagePush(context.TODO(), repoName, types.ImagePushOptions{RegistryAuth: "{}"})
+	assert.Nil(c, err)
+	_, err = io.Copy(ioutil.Discard, rc)
+	assert.Nil(c, err)
+
+	dockerfile := fmt.Sprintf(`
+		FROM %s AS foo
+		RUN touch abc
+		FROM %s
+		COPY --from=foo /abc /
+		`, repoName, repoName)
+
+	ctx := fakecontext.New(c, "",
+		fakecontext.WithDockerfile(dockerfile),
+	)
+	defer ctx.Close()
+
+	res, body, err := request.Post(
+		"/build?pull=1",
+		request.RawContent(ctx.AsTarReader(c)),
+		request.ContentType("application/x-tar"))
+	require.NoError(c, err)
+	assert.Equal(c, http.StatusOK, res.StatusCode)
+
+	out, err := testutil.ReadBody(body)
+	require.NoError(c, err)
+	assert.Contains(c, string(out), "Successfully built")
+}
+
+type buildLine struct {
+	Stream string
+	Aux    struct {
+		ID string
+	}
+}
+
+func getImageIDsFromBuild(c *check.C, output []byte) []string {
+	ids := []string{}
+	for _, line := range bytes.Split(output, []byte("\n")) {
+		if len(line) == 0 {
+			continue
+		}
+		entry := buildLine{}
+		require.NoError(c, json.Unmarshal(line, &entry))
+		if entry.Aux.ID != "" {
+			ids = append(ids, entry.Aux.ID)
+		}
+	}
+	return ids
 }

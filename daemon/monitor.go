@@ -41,29 +41,19 @@ func (daemon *Daemon) StateChanged(id string, e libcontainerd.StateInfo) error {
 		daemon.updateHealthMonitor(c)
 		daemon.LogContainerEvent(c, "oom")
 	case libcontainerd.StateExit:
-		// if container's AutoRemove flag is set, remove it after clean up
-		autoRemove := func() {
-			c.Lock()
-			ar := c.HostConfig.AutoRemove
-			c.Unlock()
-			if ar {
-				if err := daemon.ContainerRm(c.ID, &types.ContainerRmConfig{ForceRemove: true, RemoveVolume: true}); err != nil {
-					logrus.Errorf("can't remove container %s: %v", c.ID, err)
-				}
-			}
-		}
 
 		c.Lock()
 		c.StreamConfig.Wait()
 		c.Reset(false)
 
-		restart, wait, err := c.RestartManager().ShouldRestart(e.ExitCode, c.HasBeenManuallyStopped, time.Since(c.StartedAt))
+		// If daemon is being shutdown, don't let the container restart
+		restart, wait, err := c.RestartManager().ShouldRestart(e.ExitCode, daemon.IsShuttingDown() || c.HasBeenManuallyStopped, time.Since(c.StartedAt))
 		if err == nil && restart {
 			c.RestartCount++
 			c.SetRestarting(platformConstructExitStatus(e))
 		} else {
 			c.SetStopped(platformConstructExitStatus(e))
-			defer autoRemove()
+			defer daemon.autoRemove(c)
 		}
 
 		// cancel healthcheck here, they will be automatically
@@ -79,13 +69,17 @@ func (daemon *Daemon) StateChanged(id string, e libcontainerd.StateInfo) error {
 			go func() {
 				err := <-wait
 				if err == nil {
+					// daemon.netController is initialized when daemon is restoring containers.
+					// But containerStart will use daemon.netController segment.
+					// So to avoid panic at startup process, here must wait util daemon restore done.
+					daemon.waitForStartupDone()
 					if err = daemon.containerStart(c, "", "", false); err != nil {
 						logrus.Debugf("failed to restart container: %+v", err)
 					}
 				}
 				if err != nil {
 					c.SetStopped(platformConstructExitStatus(e))
-					defer autoRemove()
+					defer daemon.autoRemove(c)
 					if err != restartmanager.ErrRestartCanceled {
 						logrus.Errorf("restartmanger wait error: %+v", err)
 					}
@@ -152,4 +146,25 @@ func (daemon *Daemon) StateChanged(id string, e libcontainerd.StateInfo) error {
 		daemon.LogContainerEvent(c, "unpause")
 	}
 	return nil
+}
+
+func (daemon *Daemon) autoRemove(c *container.Container) {
+	c.Lock()
+	ar := c.HostConfig.AutoRemove
+	c.Unlock()
+	if !ar {
+		return
+	}
+
+	var err error
+	if err = daemon.ContainerRm(c.ID, &types.ContainerRmConfig{ForceRemove: true, RemoveVolume: true}); err == nil {
+		return
+	}
+	if c := daemon.containers.Get(c.ID); c == nil {
+		return
+	}
+
+	if err != nil {
+		logrus.WithError(err).WithField("container", c.ID).Error("error removing container")
+	}
 }

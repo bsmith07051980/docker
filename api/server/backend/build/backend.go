@@ -8,6 +8,7 @@ import (
 	"github.com/docker/docker/builder"
 	"github.com/docker/docker/builder/dockerfile"
 	"github.com/docker/docker/image"
+	"github.com/docker/docker/pkg/idtools"
 	"github.com/docker/docker/pkg/stringid"
 	"github.com/pkg/errors"
 	"golang.org/x/net/context"
@@ -16,7 +17,7 @@ import (
 // ImageComponent provides an interface for working with images
 type ImageComponent interface {
 	SquashImage(from string, to string) (string, error)
-	TagImageWithReference(image.ID, reference.Named) error
+	TagImageWithReference(image.ID, string, reference.Named) error
 }
 
 // Backend provides build functionality to the API router
@@ -26,8 +27,8 @@ type Backend struct {
 }
 
 // NewBackend creates a new build backend from components
-func NewBackend(components ImageComponent, builderBackend builder.Backend) *Backend {
-	manager := dockerfile.NewBuildManager(builderBackend)
+func NewBackend(components ImageComponent, builderBackend builder.Backend, idMappings *idtools.IDMappings) *Backend {
+	manager := dockerfile.NewBuildManager(builderBackend, idMappings)
 	return &Backend{imageComponent: components, manager: manager}
 }
 

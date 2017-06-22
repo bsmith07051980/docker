@@ -14,7 +14,6 @@ import (
 	"github.com/docker/docker/builder/dockerfile/parser"
 	"github.com/docker/docker/builder/dockerignore"
 	"github.com/docker/docker/pkg/fileutils"
-	"github.com/docker/docker/pkg/httputils"
 	"github.com/docker/docker/pkg/symlink"
 	"github.com/docker/docker/pkg/urlutil"
 	"github.com/pkg/errors"
@@ -41,6 +40,7 @@ func Detect(config backend.BuildConfig) (remote builder.Source, dockerfile *pars
 }
 
 func newArchiveRemote(rc io.ReadCloser, dockerfilePath string) (builder.Source, *parser.Result, error) {
+	defer rc.Close()
 	c, err := MakeTarSumContext(rc)
 	if err != nil {
 		return nil, nil, err
@@ -81,7 +81,7 @@ func withDockerfileFromContext(c modifiableContext, dockerfilePath string) (buil
 }
 
 func newGitRemote(gitURL string, dockerfilePath string) (builder.Source, *parser.Result, error) {
-	c, err := MakeGitContext(gitURL) // TODO: change this to NewLazyContext
+	c, err := MakeGitContext(gitURL) // TODO: change this to NewLazySource
 	if err != nil {
 		return nil, nil, err
 	}
@@ -92,7 +92,7 @@ func newURLRemote(url string, dockerfilePath string, progressReader func(in io.R
 	var dockerfile io.ReadCloser
 	dockerfileFoundErr := errors.New("found-dockerfile")
 	c, err := MakeRemoteContext(url, map[string]func(io.ReadCloser) (io.ReadCloser, error){
-		httputils.MimeTypes.TextPlain: func(rc io.ReadCloser) (io.ReadCloser, error) {
+		mimeTypes.TextPlain: func(rc io.ReadCloser) (io.ReadCloser, error) {
 			dockerfile = rc
 			return nil, dockerfileFoundErr
 		},

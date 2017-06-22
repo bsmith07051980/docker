@@ -5870,15 +5870,17 @@ func (s *DockerSuite) TestBuildCopyFromPreviousRootFS(c *check.C) {
 	dockerfile := `
 		FROM busybox AS first
 		COPY foo bar
+
 		FROM busybox
-    %s
-    COPY baz baz
-    RUN echo mno > baz/cc
+		%s
+		COPY baz baz
+		RUN echo mno > baz/cc
+
 		FROM busybox
-    COPY bar /
-    COPY --from=1 baz sub/
-    COPY --from=0 bar baz
-    COPY --from=first bar bay`
+		COPY bar /
+		COPY --from=1 baz sub/
+		COPY --from=0 bar baz
+		COPY --from=first bar bay`
 
 	ctx := fakecontext.New(c, "",
 		fakecontext.WithDockerfile(fmt.Sprintf(dockerfile, "")),
@@ -5892,31 +5894,24 @@ func (s *DockerSuite) TestBuildCopyFromPreviousRootFS(c *check.C) {
 
 	cli.BuildCmd(c, "build1", build.WithExternalBuildContext(ctx))
 
-	out := cli.DockerCmd(c, "run", "build1", "cat", "bar").Combined()
-	c.Assert(strings.TrimSpace(out), check.Equals, "def")
-	out = cli.DockerCmd(c, "run", "build1", "cat", "sub/aa").Combined()
-	c.Assert(strings.TrimSpace(out), check.Equals, "ghi")
-	out = cli.DockerCmd(c, "run", "build1", "cat", "sub/cc").Combined()
-	c.Assert(strings.TrimSpace(out), check.Equals, "mno")
-	out = cli.DockerCmd(c, "run", "build1", "cat", "baz").Combined()
-	c.Assert(strings.TrimSpace(out), check.Equals, "abc")
-	out = cli.DockerCmd(c, "run", "build1", "cat", "bay").Combined()
-	c.Assert(strings.TrimSpace(out), check.Equals, "abc")
+	cli.DockerCmd(c, "run", "build1", "cat", "bar").Assert(c, icmd.Expected{Out: "def"})
+	cli.DockerCmd(c, "run", "build1", "cat", "sub/aa").Assert(c, icmd.Expected{Out: "ghi"})
+	cli.DockerCmd(c, "run", "build1", "cat", "sub/cc").Assert(c, icmd.Expected{Out: "mno"})
+	cli.DockerCmd(c, "run", "build1", "cat", "baz").Assert(c, icmd.Expected{Out: "abc"})
+	cli.DockerCmd(c, "run", "build1", "cat", "bay").Assert(c, icmd.Expected{Out: "abc"})
 
 	result := cli.BuildCmd(c, "build2", build.WithExternalBuildContext(ctx))
 
 	// all commands should be cached
 	c.Assert(strings.Count(result.Combined(), "Using cache"), checker.Equals, 7)
+	c.Assert(getIDByName(c, "build1"), checker.Equals, getIDByName(c, "build2"))
 
 	err := ioutil.WriteFile(filepath.Join(ctx.Dir, "Dockerfile"), []byte(fmt.Sprintf(dockerfile, "COPY baz/aa foo")), 0644)
 	c.Assert(err, checker.IsNil)
 
 	// changing file in parent block should not affect last block
 	result = cli.BuildCmd(c, "build3", build.WithExternalBuildContext(ctx))
-
 	c.Assert(strings.Count(result.Combined(), "Using cache"), checker.Equals, 5)
-
-	c.Assert(getIDByName(c, "build1"), checker.Equals, getIDByName(c, "build2"))
 
 	err = ioutil.WriteFile(filepath.Join(ctx.Dir, "foo"), []byte("pqr"), 0644)
 	c.Assert(err, checker.IsNil)
@@ -5925,10 +5920,8 @@ func (s *DockerSuite) TestBuildCopyFromPreviousRootFS(c *check.C) {
 	result = cli.BuildCmd(c, "build4", build.WithExternalBuildContext(ctx))
 	c.Assert(strings.Count(result.Combined(), "Using cache"), checker.Equals, 5)
 
-	out = cli.DockerCmd(c, "run", "build4", "cat", "bay").Combined()
-	c.Assert(strings.TrimSpace(out), check.Equals, "pqr")
-	out = cli.DockerCmd(c, "run", "build4", "cat", "baz").Combined()
-	c.Assert(strings.TrimSpace(out), check.Equals, "pqr")
+	cli.DockerCmd(c, "run", "build4", "cat", "bay").Assert(c, icmd.Expected{Out: "pqr"})
+	cli.DockerCmd(c, "run", "build4", "cat", "baz").Assert(c, icmd.Expected{Out: "pqr"})
 }
 
 func (s *DockerSuite) TestBuildCopyFromPreviousRootFSErrors(c *check.C) {
@@ -5946,7 +5939,7 @@ func (s *DockerSuite) TestBuildCopyFromPreviousRootFSErrors(c *check.C) {
 			dockerfile: `
 		FROM busybox
 		COPY --from=0 foo bar`,
-			expectedError: "invalid from flag value 0 refers current build block",
+			expectedError: "invalid from flag value 0: refers to current build stage",
 		},
 		{
 			dockerfile: `
@@ -6200,6 +6193,27 @@ func (s *DockerSuite) TestBuildCopyFromWindowsIsCaseInsensitive(c *check.C) {
 		ExitCode: 0,
 		Out:      "hello world",
 	})
+}
+
+// #33176
+func (s *DockerSuite) TestBuildCopyFromResetScratch(c *check.C) {
+	testRequires(c, DaemonIsLinux)
+
+	dockerfile := `
+		FROM busybox
+		WORKDIR /foo/bar
+		FROM scratch
+		ENV FOO=bar
+		`
+	ctx := fakecontext.New(c, "",
+		fakecontext.WithDockerfile(dockerfile),
+	)
+	defer ctx.Close()
+
+	cli.BuildCmd(c, "build1", build.WithExternalBuildContext(ctx))
+
+	res := cli.InspectCmd(c, "build1", cli.Format(".Config.WorkingDir")).Combined()
+	c.Assert(strings.TrimSpace(res), checker.Equals, "")
 }
 
 func (s *DockerSuite) TestBuildIntermediateTarget(c *check.C) {
