@@ -1,4 +1,4 @@
-package logger
+package logger // import "github.com/docker/docker/daemon/logger"
 
 import (
 	"io"
@@ -7,10 +7,10 @@ import (
 	"sync"
 	"time"
 
-	"github.com/Sirupsen/logrus"
 	"github.com/docker/docker/api/types/plugins/logdriver"
 	"github.com/docker/docker/pkg/plugingetter"
 	"github.com/pkg/errors"
+	"github.com/sirupsen/logrus"
 )
 
 // pluginAdapter takes a plugin and implements the Logger interface for logger
@@ -121,6 +121,9 @@ func (a *pluginAdapterWithRead) ReadLogs(config ReadConfig) *LogWatcher {
 			// plugin should handle this, but check just in case
 			if !config.Since.IsZero() && msg.Timestamp.Before(config.Since) {
 				continue
+			}
+			if !config.Until.IsZero() && msg.Timestamp.After(config.Until) {
+				return
 			}
 
 			select {

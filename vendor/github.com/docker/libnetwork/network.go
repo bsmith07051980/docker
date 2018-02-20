@@ -8,7 +8,6 @@ import (
 	"sync"
 	"time"
 
-	"github.com/Sirupsen/logrus"
 	"github.com/docker/docker/pkg/stringid"
 	"github.com/docker/libnetwork/common"
 	"github.com/docker/libnetwork/config"
@@ -21,6 +20,7 @@ import (
 	"github.com/docker/libnetwork/networkdb"
 	"github.com/docker/libnetwork/options"
 	"github.com/docker/libnetwork/types"
+	"github.com/sirupsen/logrus"
 )
 
 // A Network represents a logical connectivity zone that containers may
@@ -92,12 +92,20 @@ type EndpointWalker func(ep Endpoint) bool
 // Its an indication to defer PTR queries also to that external server.
 type ipInfo struct {
 	name        string
+	serviceID   string
 	extResolver bool
 }
 
+// svcMapEntry is the body of the element into the svcMap
+// The ip is a string because the SetMatrix does not accept non hashable values
+type svcMapEntry struct {
+	ip        string
+	serviceID string
+}
+
 type svcInfo struct {
-	svcMap     map[string][]net.IP
-	svcIPv6Map map[string][]net.IP
+	svcMap     common.SetMatrix
+	svcIPv6Map common.SetMatrix
 	ipMap      common.SetMatrix
 	service    map[string][]servicePorts
 }
@@ -191,39 +199,40 @@ func (i *IpamInfo) UnmarshalJSON(data []byte) error {
 }
 
 type network struct {
-	ctrlr        *controller
-	name         string
-	networkType  string
-	id           string
-	created      time.Time
-	scope        string // network data scope
-	labels       map[string]string
-	ipamType     string
-	ipamOptions  map[string]string
-	addrSpace    string
-	ipamV4Config []*IpamConf
-	ipamV6Config []*IpamConf
-	ipamV4Info   []*IpamInfo
-	ipamV6Info   []*IpamInfo
-	enableIPv6   bool
-	postIPv6     bool
-	epCnt        *endpointCnt
-	generic      options.Generic
-	dbIndex      uint64
-	dbExists     bool
-	persist      bool
-	stopWatchCh  chan struct{}
-	drvOnce      *sync.Once
-	resolverOnce sync.Once
-	resolver     []Resolver
-	internal     bool
-	attachable   bool
-	inDelete     bool
-	ingress      bool
-	driverTables []networkDBTable
-	dynamic      bool
-	configOnly   bool
-	configFrom   string
+	ctrlr          *controller
+	name           string
+	networkType    string
+	id             string
+	created        time.Time
+	scope          string // network data scope
+	labels         map[string]string
+	ipamType       string
+	ipamOptions    map[string]string
+	addrSpace      string
+	ipamV4Config   []*IpamConf
+	ipamV6Config   []*IpamConf
+	ipamV4Info     []*IpamInfo
+	ipamV6Info     []*IpamInfo
+	enableIPv6     bool
+	postIPv6       bool
+	epCnt          *endpointCnt
+	generic        options.Generic
+	dbIndex        uint64
+	dbExists       bool
+	persist        bool
+	stopWatchCh    chan struct{}
+	drvOnce        *sync.Once
+	resolverOnce   sync.Once
+	resolver       []Resolver
+	internal       bool
+	attachable     bool
+	inDelete       bool
+	ingress        bool
+	driverTables   []networkDBTable
+	dynamic        bool
+	configOnly     bool
+	configFrom     string
+	loadBalancerIP net.IP
 	sync.Mutex
 }
 
@@ -426,15 +435,11 @@ func (n *network) applyConfigurationTo(to *network) error {
 	}
 	if len(n.ipamV4Config) > 0 {
 		to.ipamV4Config = make([]*IpamConf, 0, len(n.ipamV4Config))
-		for _, v4conf := range n.ipamV4Config {
-			to.ipamV4Config = append(to.ipamV4Config, v4conf)
-		}
+		to.ipamV4Config = append(to.ipamV4Config, n.ipamV4Config...)
 	}
 	if len(n.ipamV6Config) > 0 {
 		to.ipamV6Config = make([]*IpamConf, 0, len(n.ipamV6Config))
-		for _, v6conf := range n.ipamV6Config {
-			to.ipamV6Config = append(to.ipamV6Config, v6conf)
-		}
+		to.ipamV6Config = append(to.ipamV6Config, n.ipamV6Config...)
 	}
 	if len(n.generic) > 0 {
 		to.generic = options.Generic{}
@@ -469,6 +474,7 @@ func (n *network) CopyTo(o datastore.KVObject) error {
 	dstN.ingress = n.ingress
 	dstN.configOnly = n.configOnly
 	dstN.configFrom = n.configFrom
+	dstN.loadBalancerIP = n.loadBalancerIP
 
 	// copy labels
 	if dstN.labels == nil {
@@ -585,6 +591,7 @@ func (n *network) MarshalJSON() ([]byte, error) {
 	netMap["ingress"] = n.ingress
 	netMap["configOnly"] = n.configOnly
 	netMap["configFrom"] = n.configFrom
+	netMap["loadBalancerIP"] = n.loadBalancerIP
 	return json.Marshal(netMap)
 }
 
@@ -695,6 +702,9 @@ func (n *network) UnmarshalJSON(b []byte) (err error) {
 	if v, ok := netMap["configFrom"]; ok {
 		n.configFrom = v.(string)
 	}
+	if v, ok := netMap["loadBalancerIP"]; ok {
+		n.loadBalancerIP = net.ParseIP(v.(string))
+	}
 	// Reconcile old networks with the recently added `--ipv6` flag
 	if !n.enableIPv6 {
 		n.enableIPv6 = len(n.ipamV6Info) > 0
@@ -795,6 +805,13 @@ func NetworkOptionIpam(ipamDriver string, addrSpace string, ipV4 []*IpamConf, ip
 	}
 }
 
+// NetworkOptionLBEndpoint function returns an option setter for the configuration of the load balancer endpoint for this network
+func NetworkOptionLBEndpoint(ip net.IP) NetworkOption {
+	return func(n *network) {
+		n.loadBalancerIP = ip
+	}
+}
+
 // NetworkOptionDriverOpts function returns an option setter for any driver parameter described by a map
 func NetworkOptionDriverOpts(opts map[string]string) NetworkOption {
 	return func(n *network) {
@@ -865,8 +882,7 @@ func (n *network) resolveDriver(name string, load bool) (driverapi.Driver, *driv
 	d, cap := c.drvRegistry.Driver(name)
 	if d == nil {
 		if load {
-			var err error
-			err = c.loadDriver(name)
+			err := c.loadDriver(name)
 			if err != nil {
 				return nil, nil, err
 			}
@@ -933,9 +949,24 @@ func (n *network) delete(force bool) error {
 	id := n.id
 	n.Unlock()
 
+	c.networkLocker.Lock(id)
+	defer c.networkLocker.Unlock(id)
+
 	n, err := c.getNetworkFromStore(id)
 	if err != nil {
 		return &UnknownNetworkError{name: name, id: id}
+	}
+
+	if len(n.loadBalancerIP) != 0 {
+		endpoints := n.Endpoints()
+		if force || len(endpoints) == 1 {
+			n.deleteLoadBalancerSandbox()
+		}
+		//Reload the network from the store to update the epcnt.
+		n, err = c.getNetworkFromStore(id)
+		if err != nil {
+			return &UnknownNetworkError{name: name, id: id}
+		}
 	}
 
 	if !force && n.getEpCnt().EndpointCnt() != 0 {
@@ -989,13 +1020,11 @@ func (n *network) delete(force bool) error {
 		logrus.Errorf("Failed leaving network %s from the agent cluster: %v", n.Name(), err)
 	}
 
-	c.cleanupServiceBindings(n.ID())
+	// Cleanup the service discovery for this network
+	c.cleanupServiceDiscovery(n.ID())
 
-	// The network had been left, the service discovery can be cleaned up
-	c.Lock()
-	logrus.Debugf("network %s delete, clean svcRecords", n.id)
-	delete(c.svcRecords, n.id)
-	c.Unlock()
+	// Cleanup the load balancer
+	c.cleanupServiceBindings(n.ID())
 
 removeFromStore:
 	// deleteFromStore performs an atomic delete operation and the
@@ -1067,6 +1096,16 @@ func (n *network) CreateEndpoint(name string, options ...EndpointOption) (Endpoi
 		return nil, types.ForbiddenErrorf("endpoint with name %s already exists in network %s", name, n.Name())
 	}
 
+	n.ctrlr.networkLocker.Lock(n.id)
+	defer n.ctrlr.networkLocker.Unlock(n.id)
+
+	return n.createEndpoint(name, options...)
+
+}
+
+func (n *network) createEndpoint(name string, options ...EndpointOption) (Endpoint, error) {
+	var err error
+
 	ep := &endpoint{name: name, generic: make(map[string]interface{}), iface: &endpointInterface{}}
 	ep.id = stringid.GenerateRandomID()
 
@@ -1117,6 +1156,18 @@ func (n *network) CreateEndpoint(name string, options ...EndpointOption) (Endpoi
 			ep.releaseAddress()
 		}
 	}()
+	// Moving updateToSTore before calling addEndpoint so that we shall clean up VETH interfaces in case
+	// DockerD get killed between addEndpoint and updateSTore call
+	if err = n.getController().updateToStore(ep); err != nil {
+		return nil, err
+	}
+	defer func() {
+		if err != nil {
+			if e := n.getController().deleteFromStore(ep); e != nil {
+				logrus.Warnf("error rolling back endpoint %s from store: %v", name, e)
+			}
+		}
+	}()
 
 	if err = n.addEndpoint(ep); err != nil {
 		return nil, err
@@ -1132,17 +1183,6 @@ func (n *network) CreateEndpoint(name string, options ...EndpointOption) (Endpoi
 	if err = ep.assignAddress(ipam, false, n.enableIPv6 && n.postIPv6); err != nil {
 		return nil, err
 	}
-
-	if err = n.getController().updateToStore(ep); err != nil {
-		return nil, err
-	}
-	defer func() {
-		if err != nil {
-			if e := n.getController().deleteFromStore(ep); e != nil {
-				logrus.Warnf("error rolling back endpoint %s from store: %v", name, e)
-			}
-		}
-	}()
 
 	// Watch for service records
 	n.getController().watchSvcRecord(ep)
@@ -1228,75 +1268,77 @@ func (n *network) updateSvcRecord(ep *endpoint, localEps []*endpoint, isAdd bool
 			ipv6 = iface.AddressIPv6().IP
 		}
 
+		serviceID := ep.svcID
+		if serviceID == "" {
+			serviceID = ep.ID()
+		}
 		if isAdd {
 			// If anonymous endpoint has an alias use the first alias
 			// for ip->name mapping. Not having the reverse mapping
 			// breaks some apps
 			if ep.isAnonymous() {
 				if len(myAliases) > 0 {
-					n.addSvcRecords(ep.ID(), myAliases[0], iface.Address().IP, ipv6, true, "updateSvcRecord")
+					n.addSvcRecords(ep.ID(), myAliases[0], serviceID, iface.Address().IP, ipv6, true, "updateSvcRecord")
 				}
 			} else {
-				n.addSvcRecords(ep.ID(), epName, iface.Address().IP, ipv6, true, "updateSvcRecord")
+				n.addSvcRecords(ep.ID(), epName, serviceID, iface.Address().IP, ipv6, true, "updateSvcRecord")
 			}
 			for _, alias := range myAliases {
-				n.addSvcRecords(ep.ID(), alias, iface.Address().IP, ipv6, false, "updateSvcRecord")
+				n.addSvcRecords(ep.ID(), alias, serviceID, iface.Address().IP, ipv6, false, "updateSvcRecord")
 			}
 		} else {
 			if ep.isAnonymous() {
 				if len(myAliases) > 0 {
-					n.deleteSvcRecords(ep.ID(), myAliases[0], iface.Address().IP, ipv6, true, "updateSvcRecord")
+					n.deleteSvcRecords(ep.ID(), myAliases[0], serviceID, iface.Address().IP, ipv6, true, "updateSvcRecord")
 				}
 			} else {
-				n.deleteSvcRecords(ep.ID(), epName, iface.Address().IP, ipv6, true, "updateSvcRecord")
+				n.deleteSvcRecords(ep.ID(), epName, serviceID, iface.Address().IP, ipv6, true, "updateSvcRecord")
 			}
 			for _, alias := range myAliases {
-				n.deleteSvcRecords(ep.ID(), alias, iface.Address().IP, ipv6, false, "updateSvcRecord")
+				n.deleteSvcRecords(ep.ID(), alias, serviceID, iface.Address().IP, ipv6, false, "updateSvcRecord")
 			}
 		}
 	}
 }
 
-func addIPToName(ipMap common.SetMatrix, name string, ip net.IP) {
+func addIPToName(ipMap common.SetMatrix, name, serviceID string, ip net.IP) {
 	reverseIP := netutils.ReverseIP(ip.String())
 	ipMap.Insert(reverseIP, ipInfo{
-		name: name,
+		name:      name,
+		serviceID: serviceID,
 	})
 }
 
-func addNameToIP(svcMap map[string][]net.IP, name string, epIP net.IP) {
-	ipList := svcMap[name]
-	for _, ip := range ipList {
-		if ip.Equal(epIP) {
-			return
-		}
-	}
-	svcMap[name] = append(svcMap[name], epIP)
+func delIPToName(ipMap common.SetMatrix, name, serviceID string, ip net.IP) {
+	reverseIP := netutils.ReverseIP(ip.String())
+	ipMap.Remove(reverseIP, ipInfo{
+		name:      name,
+		serviceID: serviceID,
+	})
 }
 
-func delNameToIP(svcMap map[string][]net.IP, name string, epIP net.IP) {
-	ipList := svcMap[name]
-	for i, ip := range ipList {
-		if ip.Equal(epIP) {
-			ipList = append(ipList[:i], ipList[i+1:]...)
-			break
-		}
-	}
-	svcMap[name] = ipList
-
-	if len(ipList) == 0 {
-		delete(svcMap, name)
-	}
+func addNameToIP(svcMap common.SetMatrix, name, serviceID string, epIP net.IP) {
+	svcMap.Insert(name, svcMapEntry{
+		ip:        epIP.String(),
+		serviceID: serviceID,
+	})
 }
 
-func (n *network) addSvcRecords(eID, name string, epIP net.IP, epIPv6 net.IP, ipMapUpdate bool, method string) {
+func delNameToIP(svcMap common.SetMatrix, name, serviceID string, epIP net.IP) {
+	svcMap.Remove(name, svcMapEntry{
+		ip:        epIP.String(),
+		serviceID: serviceID,
+	})
+}
+
+func (n *network) addSvcRecords(eID, name, serviceID string, epIP, epIPv6 net.IP, ipMapUpdate bool, method string) {
 	// Do not add service names for ingress network as this is a
 	// routing only network
 	if n.ingress {
 		return
 	}
 
-	logrus.Debugf("%s (%s).addSvcRecords(%s, %s, %s, %t) %s", eID, n.ID()[0:7], name, epIP, epIPv6, ipMapUpdate, method)
+	logrus.Debugf("%s (%s).addSvcRecords(%s, %s, %s, %t) %s sid:%s", eID, n.ID()[0:7], name, epIP, epIPv6, ipMapUpdate, method, serviceID)
 
 	c := n.getController()
 	c.Lock()
@@ -1305,34 +1347,34 @@ func (n *network) addSvcRecords(eID, name string, epIP net.IP, epIPv6 net.IP, ip
 	sr, ok := c.svcRecords[n.ID()]
 	if !ok {
 		sr = svcInfo{
-			svcMap:     make(map[string][]net.IP),
-			svcIPv6Map: make(map[string][]net.IP),
+			svcMap:     common.NewSetMatrix(),
+			svcIPv6Map: common.NewSetMatrix(),
 			ipMap:      common.NewSetMatrix(),
 		}
 		c.svcRecords[n.ID()] = sr
 	}
 
 	if ipMapUpdate {
-		addIPToName(sr.ipMap, name, epIP)
+		addIPToName(sr.ipMap, name, serviceID, epIP)
 		if epIPv6 != nil {
-			addIPToName(sr.ipMap, name, epIPv6)
+			addIPToName(sr.ipMap, name, serviceID, epIPv6)
 		}
 	}
 
-	addNameToIP(sr.svcMap, name, epIP)
+	addNameToIP(sr.svcMap, name, serviceID, epIP)
 	if epIPv6 != nil {
-		addNameToIP(sr.svcIPv6Map, name, epIPv6)
+		addNameToIP(sr.svcIPv6Map, name, serviceID, epIPv6)
 	}
 }
 
-func (n *network) deleteSvcRecords(eID, name string, epIP net.IP, epIPv6 net.IP, ipMapUpdate bool, method string) {
+func (n *network) deleteSvcRecords(eID, name, serviceID string, epIP net.IP, epIPv6 net.IP, ipMapUpdate bool, method string) {
 	// Do not delete service names from ingress network as this is a
 	// routing only network
 	if n.ingress {
 		return
 	}
 
-	logrus.Debugf("%s (%s).deleteSvcRecords(%s, %s, %s, %t) %s", eID, n.ID()[0:7], name, epIP, epIPv6, ipMapUpdate, method)
+	logrus.Debugf("%s (%s).deleteSvcRecords(%s, %s, %s, %t) %s sid:%s ", eID, n.ID()[0:7], name, epIP, epIPv6, ipMapUpdate, method, serviceID)
 
 	c := n.getController()
 	c.Lock()
@@ -1344,21 +1386,17 @@ func (n *network) deleteSvcRecords(eID, name string, epIP net.IP, epIPv6 net.IP,
 	}
 
 	if ipMapUpdate {
-		sr.ipMap.Remove(netutils.ReverseIP(epIP.String()), ipInfo{
-			name: name,
-		})
+		delIPToName(sr.ipMap, name, serviceID, epIP)
 
 		if epIPv6 != nil {
-			sr.ipMap.Remove(netutils.ReverseIP(epIPv6.String()), ipInfo{
-				name: name,
-			})
+			delIPToName(sr.ipMap, name, serviceID, epIPv6)
 		}
 	}
 
-	delNameToIP(sr.svcMap, name, epIP)
+	delNameToIP(sr.svcMap, name, serviceID, epIP)
 
 	if epIPv6 != nil {
-		delNameToIP(sr.svcIPv6Map, name, epIPv6)
+		delNameToIP(sr.svcIPv6Map, name, serviceID, epIPv6)
 	}
 }
 
@@ -1376,19 +1414,31 @@ func (n *network) getSvcRecords(ep *endpoint) []etchosts.Record {
 
 	n.ctrlr.Lock()
 	defer n.ctrlr.Unlock()
-	sr, _ := n.ctrlr.svcRecords[n.id]
+	sr, ok := n.ctrlr.svcRecords[n.id]
+	if !ok || sr.svcMap == nil {
+		return nil
+	}
 
-	for h, ip := range sr.svcMap {
-		if strings.Split(h, ".")[0] == epName {
+	svcMapKeys := sr.svcMap.Keys()
+	// Loop on service names on this network
+	for _, k := range svcMapKeys {
+		if strings.Split(k, ".")[0] == epName {
 			continue
 		}
-		if len(ip) == 0 {
-			logrus.Warnf("Found empty list of IP addresses for service %s on network %s (%s)", h, n.name, n.id)
+		// Get all the IPs associated to this service
+		mapEntryList, ok := sr.svcMap.Get(k)
+		if !ok {
+			// The key got deleted
 			continue
 		}
+		if len(mapEntryList) == 0 {
+			logrus.Warnf("Found empty list of IP addresses for service %s on network %s (%s)", k, n.name, n.id)
+			continue
+		}
+
 		recs = append(recs, etchosts.Record{
-			Hosts: h,
-			IP:    ip[0].String(),
+			Hosts: k,
+			IP:    mapEntryList[0].(svcMapEntry).ip,
 		})
 	}
 
@@ -1433,11 +1483,7 @@ func (n *network) ipamAllocate() error {
 	}
 
 	err = n.ipamAllocateVersion(6, ipam)
-	if err != nil {
-		return err
-	}
-
-	return nil
+	return err
 }
 
 func (n *network) requestPoolHelper(ipam ipamapi.Ipam, addressSpace, preferredPool, subPool string, options map[string]string, v6 bool) (string, *net.IPNet, map[string]string, error) {
@@ -1636,9 +1682,7 @@ func (n *network) getIPInfo(ipVer int) []*IpamInfo {
 	}
 	l := make([]*IpamInfo, 0, len(info))
 	n.Lock()
-	for _, d := range info {
-		l = append(l, d)
-	}
+	l = append(l, info...)
 	n.Unlock()
 	return l
 }
@@ -1845,24 +1889,30 @@ func (n *network) ResolveName(req string, ipType int) ([]net.IP, bool) {
 	}
 
 	req = strings.TrimSuffix(req, ".")
-	var ip []net.IP
-	ip, ok = sr.svcMap[req]
+	ipSet, ok := sr.svcMap.Get(req)
 
 	if ipType == types.IPv6 {
 		// If the name resolved to v4 address then its a valid name in
 		// the docker network domain. If the network is not v6 enabled
 		// set ipv6Miss to filter the DNS query from going to external
 		// resolvers.
-		if ok && n.enableIPv6 == false {
+		if ok && !n.enableIPv6 {
 			ipv6Miss = true
 		}
-		ip = sr.svcIPv6Map[req]
+		ipSet, ok = sr.svcIPv6Map.Get(req)
 	}
 
-	if ip != nil {
-		ipLocal := make([]net.IP, len(ip))
-		copy(ipLocal, ip)
-		return ipLocal, false
+	if ok && len(ipSet) > 0 {
+		// this map is to avoid IP duplicates, this can happen during a transition period where 2 services are using the same IP
+		noDup := make(map[string]bool)
+		var ipLocal []net.IP
+		for _, ip := range ipSet {
+			if _, dup := noDup[ip.(svcMapEntry).ip]; !dup {
+				noDup[ip.(svcMapEntry).ip] = true
+				ipLocal = append(ipLocal, net.ParseIP(ip.(svcMapEntry).ip))
+			}
+		}
+		return ipLocal, ok
 	}
 
 	return nil, ipv6Miss
@@ -1904,7 +1954,7 @@ func (n *network) ResolveIP(ip string) string {
 		return ""
 	}
 	// NOTE it is possible to have more than one element in the Set, this will happen
-	// because of interleave of diffent events from differnt sources (local container create vs
+	// because of interleave of different events from different sources (local container create vs
 	// network db notifications)
 	// In such cases the resolution will be based on the first element of the set, and can vary
 	// during the system stabilitation
@@ -2003,4 +2053,81 @@ func (c *controller) getConfigNetwork(name string) (*network, error) {
 	}
 
 	return n.(*network), nil
+}
+
+func (n *network) createLoadBalancerSandbox() error {
+	sandboxName := n.name + "-sbox"
+	sbOptions := []SandboxOption{}
+	if n.ingress {
+		sbOptions = append(sbOptions, OptionIngress())
+	}
+	sb, err := n.ctrlr.NewSandbox(sandboxName, sbOptions...)
+	if err != nil {
+		return err
+	}
+	defer func() {
+		if err != nil {
+			if e := n.ctrlr.SandboxDestroy(sandboxName); e != nil {
+				logrus.Warnf("could not delete sandbox %s on failure on failure (%v): %v", sandboxName, err, e)
+			}
+		}
+	}()
+
+	endpointName := n.name + "-endpoint"
+	epOptions := []EndpointOption{
+		CreateOptionIpam(n.loadBalancerIP, nil, nil, nil),
+		CreateOptionLoadBalancer(),
+	}
+	ep, err := n.createEndpoint(endpointName, epOptions...)
+	if err != nil {
+		return err
+	}
+	defer func() {
+		if err != nil {
+			if e := ep.Delete(true); e != nil {
+				logrus.Warnf("could not delete endpoint %s on failure on failure (%v): %v", endpointName, err, e)
+			}
+		}
+	}()
+
+	if err := ep.Join(sb, nil); err != nil {
+		return err
+	}
+	return sb.EnableService()
+}
+
+func (n *network) deleteLoadBalancerSandbox() {
+	n.Lock()
+	c := n.ctrlr
+	name := n.name
+	n.Unlock()
+
+	endpointName := name + "-endpoint"
+	sandboxName := name + "-sbox"
+
+	endpoint, err := n.EndpointByName(endpointName)
+	if err != nil {
+		logrus.Warnf("Failed to find load balancer endpoint %s on network %s: %v", endpointName, name, err)
+	} else {
+
+		info := endpoint.Info()
+		if info != nil {
+			sb := info.Sandbox()
+			if sb != nil {
+				if err := sb.DisableService(); err != nil {
+					logrus.Warnf("Failed to disable service on sandbox %s: %v", sandboxName, err)
+					//Ignore error and attempt to delete the load balancer endpoint
+				}
+			}
+		}
+
+		if err := endpoint.Delete(true); err != nil {
+			logrus.Warnf("Failed to delete endpoint %s (%s) in %s: %v", endpoint.Name(), endpoint.ID(), sandboxName, err)
+			//Ignore error and attempt to delete the sandbox.
+		}
+	}
+
+	if err := c.SandboxDestroy(sandboxName); err != nil {
+		logrus.Warnf("Failed to delete %s sandbox: %v", sandboxName, err)
+	}
 }

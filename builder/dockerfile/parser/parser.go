@@ -1,5 +1,5 @@
 // Package parser implements a parser and parse tree dumper for Dockerfiles.
-package parser
+package parser // import "github.com/docker/docker/builder/dockerfile/parser"
 
 import (
 	"bufio"
@@ -91,9 +91,6 @@ var (
 // DefaultEscapeToken is the default escape token
 const DefaultEscapeToken = '\\'
 
-// DefaultPlatformToken is the platform assumed for the build if not explicitly provided
-var DefaultPlatformToken = runtime.GOOS
-
 // Directive is the structure used during a build run to hold the state of
 // parsing directives.
 type Directive struct {
@@ -119,7 +116,7 @@ func (d *Directive) setEscapeToken(s string) error {
 func (d *Directive) setPlatformToken(s string) error {
 	s = strings.ToLower(s)
 	valid := []string{runtime.GOOS}
-	if runtime.GOOS == "windows" && system.LCOWSupported() {
+	if system.LCOWSupported() {
 		valid = append(valid, "linux")
 	}
 	for _, item := range valid {
@@ -143,7 +140,7 @@ func (d *Directive) possibleParserDirective(line string) error {
 	if len(tecMatch) != 0 {
 		for i, n := range tokenEscapeCommand.SubexpNames() {
 			if n == "escapechar" {
-				if d.escapeSeen == true {
+				if d.escapeSeen {
 					return errors.New("only one escape parser directive can be used")
 				}
 				d.escapeSeen = true
@@ -152,14 +149,13 @@ func (d *Directive) possibleParserDirective(line string) error {
 		}
 	}
 
-	// TODO @jhowardmsft LCOW Support: Eventually this check can be removed,
-	// but only recognise a platform token if running in LCOW mode.
-	if runtime.GOOS == "windows" && system.LCOWSupported() {
+	// Only recognise a platform token if LCOW is supported
+	if system.LCOWSupported() {
 		tpcMatch := tokenPlatformCommand.FindStringSubmatch(strings.ToLower(line))
 		if len(tpcMatch) != 0 {
 			for i, n := range tokenPlatformCommand.SubexpNames() {
 				if n == "platform" {
-					if d.platformSeen == true {
+					if d.platformSeen {
 						return errors.New("only one platform parser directive can be used")
 					}
 					d.platformSeen = true
@@ -177,7 +173,6 @@ func (d *Directive) possibleParserDirective(line string) error {
 func NewDefaultDirective() *Directive {
 	directive := Directive{}
 	directive.setEscapeToken(string(DefaultEscapeToken))
-	directive.setPlatformToken(runtime.GOOS)
 	return &directive
 }
 
@@ -242,7 +237,18 @@ func newNodeFromLine(line string, directive *Directive) (*Node, error) {
 type Result struct {
 	AST         *Node
 	EscapeToken rune
-	Platform    string
+	// TODO @jhowardmsft - see https://github.com/moby/moby/issues/34617
+	// This next field will be removed in a future update for LCOW support.
+	OS       string
+	Warnings []string
+}
+
+// PrintWarnings to the writer
+func (r *Result) PrintWarnings(out io.Writer) {
+	if len(r.Warnings) == 0 {
+		return
+	}
+	fmt.Fprintf(out, strings.Join(r.Warnings, "\n")+"\n")
 }
 
 // Parse reads lines from a Reader, parses the lines into an AST and returns
@@ -252,6 +258,7 @@ func Parse(rwc io.Reader) (*Result, error) {
 	currentLine := 0
 	root := &Node{StartLine: -1}
 	scanner := bufio.NewScanner(rwc)
+	warnings := []string{}
 
 	var err error
 	for scanner.Scan() {
@@ -272,6 +279,7 @@ func Parse(rwc io.Reader) (*Result, error) {
 			continue
 		}
 
+		var hasEmptyContinuationLine bool
 		for !isEndOfLine && scanner.Scan() {
 			bytesRead, err := processLine(d, scanner.Bytes(), false)
 			if err != nil {
@@ -279,8 +287,12 @@ func Parse(rwc io.Reader) (*Result, error) {
 			}
 			currentLine++
 
-			// TODO: warn this is being deprecated/removed
+			if isComment(scanner.Bytes()) {
+				// original line was a comment (processLine strips comments)
+				continue
+			}
 			if isEmptyContinuationLine(bytesRead) {
+				hasEmptyContinuationLine = true
 				continue
 			}
 
@@ -289,13 +301,27 @@ func Parse(rwc io.Reader) (*Result, error) {
 			line += continuationLine
 		}
 
+		if hasEmptyContinuationLine {
+			warning := "[WARNING]: Empty continuation line found in:\n    " + line
+			warnings = append(warnings, warning)
+		}
+
 		child, err := newNodeFromLine(line, d)
 		if err != nil {
 			return nil, err
 		}
 		root.AddChild(child, startLine, currentLine)
 	}
-	return &Result{AST: root, EscapeToken: d.escapeToken, Platform: d.platformToken}, nil
+
+	if len(warnings) > 0 {
+		warnings = append(warnings, "[WARNING]: Empty continuation lines will become errors in a future release.")
+	}
+	return &Result{
+		AST:         root,
+		Warnings:    warnings,
+		EscapeToken: d.escapeToken,
+		OS:          d.platformToken,
+	}, handleScannerError(scanner.Err())
 }
 
 func trimComments(src []byte) []byte {
@@ -306,8 +332,12 @@ func trimWhitespace(src []byte) []byte {
 	return bytes.TrimLeftFunc(src, unicode.IsSpace)
 }
 
+func isComment(line []byte) bool {
+	return tokenComment.Match(trimWhitespace(line))
+}
+
 func isEmptyContinuationLine(line []byte) bool {
-	return len(trimComments(trimWhitespace(line))) == 0
+	return len(trimWhitespace(line)) == 0
 }
 
 var utf8bom = []byte{0xEF, 0xBB, 0xBF}
@@ -326,6 +356,14 @@ func processLine(d *Directive, token []byte, stripLeftWhitespace bool) ([]byte, 
 	if stripLeftWhitespace {
 		token = trimWhitespace(token)
 	}
-	err := d.possibleParserDirective(string(token))
-	return trimComments(token), err
+	return trimComments(token), d.possibleParserDirective(string(token))
+}
+
+func handleScannerError(err error) error {
+	switch err {
+	case bufio.ErrTooLong:
+		return errors.Errorf("dockerfile line greater than max allowed size of %d", bufio.MaxScanTokenSize-1)
+	default:
+		return err
+	}
 }

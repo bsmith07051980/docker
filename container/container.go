@@ -1,6 +1,7 @@
-package container
+package container // import "github.com/docker/docker/container"
 
 import (
+	"bytes"
 	"encoding/json"
 	"fmt"
 	"io"
@@ -14,9 +15,7 @@ import (
 	"syscall"
 	"time"
 
-	"golang.org/x/net/context"
-
-	"github.com/Sirupsen/logrus"
+	"github.com/containerd/containerd/cio"
 	containertypes "github.com/docker/docker/api/types/container"
 	mounttypes "github.com/docker/docker/api/types/mount"
 	networktypes "github.com/docker/docker/api/types/network"
@@ -28,8 +27,8 @@ import (
 	"github.com/docker/docker/daemon/network"
 	"github.com/docker/docker/image"
 	"github.com/docker/docker/layer"
-	"github.com/docker/docker/libcontainerd"
 	"github.com/docker/docker/opts"
+	"github.com/docker/docker/pkg/containerfs"
 	"github.com/docker/docker/pkg/idtools"
 	"github.com/docker/docker/pkg/ioutils"
 	"github.com/docker/docker/pkg/signal"
@@ -45,29 +44,38 @@ import (
 	"github.com/docker/libnetwork/options"
 	"github.com/docker/libnetwork/types"
 	agentexec "github.com/docker/swarmkit/agent/exec"
-	"github.com/opencontainers/selinux/go-selinux/label"
+	"github.com/pkg/errors"
+	"github.com/sirupsen/logrus"
+	"golang.org/x/net/context"
 )
 
 const configFileName = "config.v2.json"
 
-const (
-	// DefaultStopTimeout is the timeout (in seconds) for the syscall signal used to stop a container.
-	DefaultStopTimeout = 10
+var (
+	errInvalidEndpoint = errors.New("invalid endpoint while building port map info")
+	errInvalidNetwork  = errors.New("invalid network settings while building port map info")
 )
 
-var (
-	errInvalidEndpoint = fmt.Errorf("invalid endpoint while building port map info")
-	errInvalidNetwork  = fmt.Errorf("invalid network settings while building port map info")
-)
+// ExitStatus provides exit reasons for a container.
+type ExitStatus struct {
+	// The exit code with which the container exited.
+	ExitCode int
+
+	// Whether the container encountered an OOM.
+	OOMKilled bool
+
+	// Time at which the container died
+	ExitedAt time.Time
+}
 
 // Container holds the structure defining a container object.
 type Container struct {
 	StreamConfig *stream.Config
 	// embed for Container to support states directly.
-	*State          `json:"State"` // Needed for Engine API version <= 1.11
-	Root            string         `json:"-"` // Path to the "home" of the container, including metadata.
-	BaseFS          string         `json:"-"` // Path to the graphdriver mountpoint
-	RWLayer         layer.RWLayer  `json:"-"`
+	*State          `json:"State"`          // Needed for Engine API version <= 1.11
+	Root            string                  `json:"-"` // Path to the "home" of the container, including metadata.
+	BaseFS          containerfs.ContainerFS `json:"-"` // interface containing graphdriver mount
+	RWLayer         layer.RWLayer           `json:"-"`
 	ID              string
 	Created         time.Time
 	Managed         bool
@@ -79,7 +87,7 @@ type Container struct {
 	LogPath         string
 	Name            string
 	Driver          string
-	Platform        string
+	OS              string
 	// MountLabel contains the options for the 'mount' command
 	MountLabel             string
 	ProcessLabel           string
@@ -108,7 +116,8 @@ type Container struct {
 	NoNewPrivileges bool
 
 	// Fields here are specific to Windows
-	NetworkSharedContainerID string
+	NetworkSharedContainerID string   `json:"-"`
+	SharedEndpointList       []string `json:"-"`
 }
 
 // NewBaseContainer creates a new container with its
@@ -145,48 +154,58 @@ func (container *Container) FromDisk() error {
 		return err
 	}
 
-	// Ensure the platform is set if blank. Assume it is the platform of the
-	// host OS if not, to ensure containers created before multiple-platform
+	// Ensure the operating system is set if blank. Assume it is the OS of the
+	// host OS if not, to ensure containers created before multiple-OS
 	// support are migrated
-	if container.Platform == "" {
-		container.Platform = runtime.GOOS
+	if container.OS == "" {
+		container.OS = runtime.GOOS
 	}
 
-	if err := label.ReserveLabel(container.ProcessLabel); err != nil {
-		return err
-	}
 	return container.readHostConfig()
 }
 
-// ToDisk saves the container configuration on disk.
-func (container *Container) ToDisk() error {
+// toDisk saves the container configuration on disk and returns a deep copy.
+func (container *Container) toDisk() (*Container, error) {
+	var (
+		buf      bytes.Buffer
+		deepCopy Container
+	)
 	pth, err := container.ConfigPath()
 	if err != nil {
-		return err
+		return nil, err
 	}
 
-	jsonSource, err := ioutils.NewAtomicFileWriter(pth, 0644)
+	// Save container settings
+	f, err := ioutils.NewAtomicFileWriter(pth, 0600)
+	if err != nil {
+		return nil, err
+	}
+	defer f.Close()
+
+	w := io.MultiWriter(&buf, f)
+	if err := json.NewEncoder(w).Encode(container); err != nil {
+		return nil, err
+	}
+
+	if err := json.NewDecoder(&buf).Decode(&deepCopy); err != nil {
+		return nil, err
+	}
+	deepCopy.HostConfig, err = container.WriteHostConfig()
+	if err != nil {
+		return nil, err
+	}
+
+	return &deepCopy, nil
+}
+
+// CheckpointTo makes the Container's current state visible to queries, and persists state.
+// Callers must hold a Container lock.
+func (container *Container) CheckpointTo(store ViewDB) error {
+	deepCopy, err := container.toDisk()
 	if err != nil {
 		return err
 	}
-	defer jsonSource.Close()
-
-	enc := json.NewEncoder(jsonSource)
-
-	// Save container settings
-	if err := enc.Encode(container); err != nil {
-		return err
-	}
-
-	return container.WriteHostConfig()
-}
-
-// ToDiskLocking saves the container configuration on disk in a thread safe way.
-func (container *Container) ToDiskLocking() error {
-	container.Lock()
-	err := container.ToDisk()
-	container.Unlock()
-	return err
+	return store.Save(deepCopy)
 }
 
 // readHostConfig reads the host configuration from disk for the container.
@@ -218,30 +237,49 @@ func (container *Container) readHostConfig() error {
 	return nil
 }
 
-// WriteHostConfig saves the host configuration on disk for the container.
-func (container *Container) WriteHostConfig() error {
+// WriteHostConfig saves the host configuration on disk for the container,
+// and returns a deep copy of the saved object. Callers must hold a Container lock.
+func (container *Container) WriteHostConfig() (*containertypes.HostConfig, error) {
+	var (
+		buf      bytes.Buffer
+		deepCopy containertypes.HostConfig
+	)
+
 	pth, err := container.HostConfigPath()
 	if err != nil {
-		return err
+		return nil, err
 	}
 
 	f, err := ioutils.NewAtomicFileWriter(pth, 0644)
 	if err != nil {
-		return err
+		return nil, err
 	}
 	defer f.Close()
 
-	return json.NewEncoder(f).Encode(&container.HostConfig)
+	w := io.MultiWriter(&buf, f)
+	if err := json.NewEncoder(w).Encode(&container.HostConfig); err != nil {
+		return nil, err
+	}
+
+	if err := json.NewDecoder(&buf).Decode(&deepCopy); err != nil {
+		return nil, err
+	}
+	return &deepCopy, nil
 }
 
 // SetupWorkingDirectory sets up the container's working directory as set in container.Config.WorkingDir
 func (container *Container) SetupWorkingDirectory(rootIDs idtools.IDPair) error {
+	// TODO @jhowardmsft, @gupta-ak LCOW Support. This will need revisiting.
+	// We will need to do remote filesystem operations here.
+	if container.OS != runtime.GOOS {
+		return nil
+	}
+
 	if container.Config.WorkingDir == "" {
 		return nil
 	}
 
 	container.Config.WorkingDir = filepath.Clean(container.Config.WorkingDir)
-
 	pth, err := container.GetResourcePath(container.Config.WorkingDir)
 	if err != nil {
 		return err
@@ -250,7 +288,7 @@ func (container *Container) SetupWorkingDirectory(rootIDs idtools.IDPair) error 
 	if err := idtools.MkdirAllAndChownNew(pth, 0755, rootIDs); err != nil {
 		pthInfo, err2 := os.Stat(pth)
 		if err2 == nil && pthInfo != nil && !pthInfo.IsDir() {
-			return fmt.Errorf("Cannot mkdir: %s is not a directory", container.Config.WorkingDir)
+			return errors.Errorf("Cannot mkdir: %s is not a directory", container.Config.WorkingDir)
 		}
 
 		return err
@@ -275,15 +313,13 @@ func (container *Container) SetupWorkingDirectory(rootIDs idtools.IDPair) error 
 func (container *Container) GetResourcePath(path string) (string, error) {
 	// IMPORTANT - These are paths on the OS where the daemon is running, hence
 	// any filepath operations must be done in an OS agnostic way.
-
-	cleanPath := cleanResourcePath(path)
-	r, e := symlink.FollowSymlinkInScope(filepath.Join(container.BaseFS, cleanPath), container.BaseFS)
+	r, e := container.BaseFS.ResolveScopedPath(path, false)
 
 	// Log this here on the daemon side as there's otherwise no indication apart
 	// from the error being propagated all the way back to the client. This makes
 	// debugging significantly easier and clearly indicates the error comes from the daemon.
 	if e != nil {
-		logrus.Errorf("Failed to FollowSymlinkInScope BaseFS %s cleanPath %s path %s %s\n", container.BaseFS, cleanPath, path, e)
+		logrus.Errorf("Failed to ResolveScopedPath BaseFS %s path %s %s\n", container.BaseFS.Path(), path, e)
 	}
 	return r, e
 }
@@ -333,7 +369,7 @@ func (container *Container) StartLogger() (logger.Logger, error) {
 	cfg := container.HostConfig.LogConfig
 	initDriver, err := logger.GetLogDriver(cfg.Type)
 	if err != nil {
-		return nil, fmt.Errorf("failed to get logging factory: %v", err)
+		return nil, errors.Wrap(err, "failed to get logging factory")
 	}
 	info := logger.Info{
 		Config:              cfg.Config,
@@ -405,6 +441,11 @@ func (container *Container) ShouldRestart() bool {
 
 // AddMountPointWithVolume adds a new mount point configured with a volume to the container.
 func (container *Container) AddMountPointWithVolume(destination string, vol volume.Volume, rw bool) {
+	operatingSystem := container.OS
+	if operatingSystem == "" {
+		operatingSystem = runtime.GOOS
+	}
+	volumeParser := volume.NewParser(operatingSystem)
 	container.MountPoints[destination] = &volume.MountPoint{
 		Type:        mounttypes.TypeVolume,
 		Name:        vol.Name(),
@@ -412,7 +453,7 @@ func (container *Container) AddMountPointWithVolume(destination string, vol volu
 		Destination: destination,
 		RW:          rw,
 		Volume:      vol,
-		CopyData:    volume.DefaultCopyMode,
+		CopyData:    volumeParser.DefaultCopyMode(),
 	}
 }
 
@@ -625,8 +666,12 @@ func (container *Container) BuildEndpointInfo(n libnetwork.Network, ep libnetwor
 	return nil
 }
 
+type named interface {
+	Name() string
+}
+
 // UpdateJoinInfo updates network settings when container joins network n with endpoint ep.
-func (container *Container) UpdateJoinInfo(n libnetwork.Network, ep libnetwork.Endpoint) error {
+func (container *Container) UpdateJoinInfo(n named, ep libnetwork.Endpoint) error {
 	if err := container.buildPortMapInfo(ep); err != nil {
 		return err
 	}
@@ -654,7 +699,7 @@ func (container *Container) UpdateSandboxNetworkSettings(sb libnetwork.Sandbox) 
 }
 
 // BuildJoinOptions builds endpoint Join options from a given network.
-func (container *Container) BuildJoinOptions(n libnetwork.Network) ([]libnetwork.EndpointOption, error) {
+func (container *Container) BuildJoinOptions(n named) ([]libnetwork.EndpointOption, error) {
 	var joinOptions []libnetwork.EndpointOption
 	if epConfig, ok := container.NetworkSettings.Networks[n.Name()]; ok {
 		for _, str := range epConfig.Links {
@@ -699,18 +744,18 @@ func (container *Container) BuildCreateEndpointOptions(n libnetwork.Network, epC
 
 			for _, ips := range ipam.LinkLocalIPs {
 				if linkip = net.ParseIP(ips); linkip == nil && ips != "" {
-					return nil, fmt.Errorf("Invalid link-local IP address:%s", ipam.LinkLocalIPs)
+					return nil, errors.Errorf("Invalid link-local IP address: %s", ipam.LinkLocalIPs)
 				}
 				ipList = append(ipList, linkip)
 
 			}
 
 			if ip = net.ParseIP(ipam.IPv4Address); ip == nil && ipam.IPv4Address != "" {
-				return nil, fmt.Errorf("Invalid IPv4 address:%s)", ipam.IPv4Address)
+				return nil, errors.Errorf("Invalid IPv4 address: %s)", ipam.IPv4Address)
 			}
 
 			if ip6 = net.ParseIP(ipam.IPv6Address); ip6 == nil && ipam.IPv6Address != "" {
-				return nil, fmt.Errorf("Invalid IPv6 address:%s)", ipam.IPv6Address)
+				return nil, errors.Errorf("Invalid IPv6 address: %s)", ipam.IPv6Address)
 			}
 
 			createOptions = append(createOptions,
@@ -720,6 +765,9 @@ func (container *Container) BuildCreateEndpointOptions(n libnetwork.Network, epC
 
 		for _, alias := range epConfig.Aliases {
 			createOptions = append(createOptions, libnetwork.CreateOptionMyAlias(alias))
+		}
+		for k, v := range epConfig.DriverOpts {
+			createOptions = append(createOptions, libnetwork.EndpointOptionGeneric(options.Generic{k: v}))
 		}
 	}
 
@@ -766,9 +814,6 @@ func (container *Container) BuildCreateEndpointOptions(n libnetwork.Network, epC
 
 			createOptions = append(createOptions, libnetwork.EndpointOptionGeneric(genericOption))
 		}
-		for k, v := range epConfig.DriverOpts {
-			createOptions = append(createOptions, libnetwork.EndpointOptionGeneric(options.Generic{k: v}))
-		}
 
 	}
 
@@ -814,7 +859,7 @@ func (container *Container) BuildCreateEndpointOptions(n libnetwork.Network, epC
 				portStart, portEnd, err = newP.Range()
 			}
 			if err != nil {
-				return nil, fmt.Errorf("Error parsing HostPort value(%s):%v", binding[i].HostPort, err)
+				return nil, errors.Wrapf(err, "Error parsing HostPort value (%s)", binding[i].HostPort)
 			}
 			pbCopy.HostPort = uint16(portStart)
 			pbCopy.HostPortEnd = uint16(portEnd)
@@ -958,10 +1003,10 @@ func (container *Container) CloseStreams() error {
 }
 
 // InitializeStdio is called by libcontainerd to connect the stdio.
-func (container *Container) InitializeStdio(iop libcontainerd.IOPipe) error {
+func (container *Container) InitializeStdio(iop *cio.DirectIO) (cio.IO, error) {
 	if err := container.startLogging(); err != nil {
 		container.Reset(false)
-		return err
+		return nil, err
 	}
 
 	container.StreamConfig.CopyToPipe(iop)
@@ -974,17 +1019,26 @@ func (container *Container) InitializeStdio(iop libcontainerd.IOPipe) error {
 		}
 	}
 
-	return nil
+	return &rio{IO: iop, sc: container.StreamConfig}, nil
+}
+
+// MountsResourcePath returns the path where mounts are stored for the given mount
+func (container *Container) MountsResourcePath(mount string) (string, error) {
+	return container.GetRootResourcePath(filepath.Join("mounts", mount))
 }
 
 // SecretMountPath returns the path of the secret mount for the container
-func (container *Container) SecretMountPath() string {
-	return filepath.Join(container.Root, "secrets")
+func (container *Container) SecretMountPath() (string, error) {
+	return container.MountsResourcePath("secrets")
 }
 
 // SecretFilePath returns the path to the location of a secret on the host.
-func (container *Container) SecretFilePath(secretRef swarmtypes.SecretReference) string {
-	return filepath.Join(container.SecretMountPath(), secretRef.SecretID)
+func (container *Container) SecretFilePath(secretRef swarmtypes.SecretReference) (string, error) {
+	secrets, err := container.SecretMountPath()
+	if err != nil {
+		return "", err
+	}
+	return filepath.Join(secrets, secretRef.SecretID), nil
 }
 
 func getSecretTargetPath(r *swarmtypes.SecretReference) string {
@@ -997,27 +1051,30 @@ func getSecretTargetPath(r *swarmtypes.SecretReference) string {
 
 // ConfigsDirPath returns the path to the directory where configs are stored on
 // disk.
-func (container *Container) ConfigsDirPath() string {
-	return filepath.Join(container.Root, "configs")
+func (container *Container) ConfigsDirPath() (string, error) {
+	return container.GetRootResourcePath("configs")
 }
 
 // ConfigFilePath returns the path to the on-disk location of a config.
-func (container *Container) ConfigFilePath(configRef swarmtypes.ConfigReference) string {
-	return filepath.Join(container.ConfigsDirPath(), configRef.ConfigID)
+func (container *Container) ConfigFilePath(configRef swarmtypes.ConfigReference) (string, error) {
+	configs, err := container.ConfigsDirPath()
+	if err != nil {
+		return "", err
+	}
+	return filepath.Join(configs, configRef.ConfigID), nil
 }
 
 // CreateDaemonEnvironment creates a new environment variable slice for this container.
 func (container *Container) CreateDaemonEnvironment(tty bool, linkedEnv []string) []string {
 	// Setup environment
-	// TODO @jhowardmsft LCOW Support. This will need revisiting later.
-	platform := container.Platform
-	if platform == "" {
-		platform = runtime.GOOS
+	os := container.OS
+	if os == "" {
+		os = runtime.GOOS
 	}
 	env := []string{}
-	if runtime.GOOS != "windows" || (runtime.GOOS == "windows" && system.LCOWSupported() && platform == "linux") {
+	if runtime.GOOS != "windows" || (runtime.GOOS == "windows" && os == "linux") {
 		env = []string{
-			"PATH=" + system.DefaultPathEnv(platform),
+			"PATH=" + system.DefaultPathEnv(os),
 			"HOSTNAME=" + container.Config.Hostname,
 		}
 		if tty {
@@ -1029,7 +1086,24 @@ func (container *Container) CreateDaemonEnvironment(tty bool, linkedEnv []string
 	// because the env on the container can override certain default values
 	// we need to replace the 'env' keys where they match and append anything
 	// else.
-	//return ReplaceOrAppendEnvValues(linkedEnv, container.Config.Env)
-	foo := ReplaceOrAppendEnvValues(env, container.Config.Env)
-	return foo
+	env = ReplaceOrAppendEnvValues(env, container.Config.Env)
+	return env
+}
+
+type rio struct {
+	cio.IO
+
+	sc *stream.Config
+}
+
+func (i *rio) Close() error {
+	i.IO.Close()
+
+	return i.sc.CloseStreams()
+}
+
+func (i *rio) Wait() {
+	i.sc.Wait()
+
+	i.IO.Wait()
 }

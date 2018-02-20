@@ -4,12 +4,12 @@ import (
 	"fmt"
 	"strings"
 
-	"github.com/Sirupsen/logrus"
 	"github.com/docker/libkv/store/boltdb"
 	"github.com/docker/libkv/store/consul"
 	"github.com/docker/libkv/store/etcd"
 	"github.com/docker/libkv/store/zookeeper"
 	"github.com/docker/libnetwork/datastore"
+	"github.com/sirupsen/logrus"
 )
 
 func registerKVStores() {
@@ -256,6 +256,7 @@ retry:
 			if err := cs.GetObject(datastore.Key(kvObject.Key()...), kvObject); err != nil {
 				return fmt.Errorf("could not update the kvobject to latest when trying to delete: %v", err)
 			}
+			logrus.Warnf("Error (%v) deleting object %v, retrying....", err, kvObject.Key())
 			goto retry
 		}
 		return err

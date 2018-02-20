@@ -1,6 +1,6 @@
 // +build linux
 
-package btrfs
+package btrfs // import "github.com/docker/docker/daemon/graphdriver/btrfs"
 
 /*
 #include <stdlib.h>
@@ -24,17 +24,17 @@ import (
 	"strconv"
 	"strings"
 	"sync"
-	"syscall"
 	"unsafe"
 
-	"github.com/Sirupsen/logrus"
 	"github.com/docker/docker/daemon/graphdriver"
+	"github.com/docker/docker/pkg/containerfs"
 	"github.com/docker/docker/pkg/idtools"
-	"github.com/docker/docker/pkg/mount"
 	"github.com/docker/docker/pkg/parsers"
 	"github.com/docker/docker/pkg/system"
 	"github.com/docker/go-units"
 	"github.com/opencontainers/selinux/go-selinux/label"
+	"github.com/sirupsen/logrus"
+	"golang.org/x/sys/unix"
 )
 
 func init() {
@@ -50,7 +50,16 @@ type btrfsOptions struct {
 // An error is returned if BTRFS is not supported.
 func Init(home string, options []string, uidMaps, gidMaps []idtools.IDMap) (graphdriver.Driver, error) {
 
-	fsMagic, err := graphdriver.GetFSMagic(home)
+	// Perform feature detection on /var/lib/docker/btrfs if it's an existing directory.
+	// This covers situations where /var/lib/docker/btrfs is a mount, and on a different
+	// filesystem than /var/lib/docker.
+	// If the path does not exist, fall back to using /var/lib/docker for feature detection.
+	testdir := home
+	if _, err := os.Stat(testdir); os.IsNotExist(err) {
+		testdir = filepath.Dir(testdir)
+	}
+
+	fsMagic, err := graphdriver.GetFSMagic(testdir)
 	if err != nil {
 		return nil, err
 	}
@@ -63,11 +72,7 @@ func Init(home string, options []string, uidMaps, gidMaps []idtools.IDMap) (grap
 	if err != nil {
 		return nil, err
 	}
-	if err := idtools.MkdirAllAs(home, 0700, rootUID, rootGID); err != nil {
-		return nil, err
-	}
-
-	if err := mount.MakePrivate(home); err != nil {
+	if err := idtools.MkdirAllAndChown(home, 0700, idtools.IDPair{UID: rootUID, GID: rootGID}); err != nil {
 		return nil, err
 	}
 
@@ -157,7 +162,7 @@ func (d *Driver) Cleanup() error {
 		return err
 	}
 
-	return mount.Unmount(d.home)
+	return nil
 }
 
 func free(p *C.char) {
@@ -197,7 +202,7 @@ func subvolCreate(path, name string) error {
 		args.name[i] = C.char(c)
 	}
 
-	_, _, errno := syscall.Syscall(syscall.SYS_IOCTL, getDirFd(dir), C.BTRFS_IOC_SUBVOL_CREATE,
+	_, _, errno := unix.Syscall(unix.SYS_IOCTL, getDirFd(dir), C.BTRFS_IOC_SUBVOL_CREATE,
 		uintptr(unsafe.Pointer(&args)))
 	if errno != 0 {
 		return fmt.Errorf("Failed to create btrfs subvolume: %v", errno.Error())
@@ -225,7 +230,7 @@ func subvolSnapshot(src, dest, name string) error {
 	C.set_name_btrfs_ioctl_vol_args_v2(&args, cs)
 	C.free(unsafe.Pointer(cs))
 
-	_, _, errno := syscall.Syscall(syscall.SYS_IOCTL, getDirFd(destDir), C.BTRFS_IOC_SNAP_CREATE_V2,
+	_, _, errno := unix.Syscall(unix.SYS_IOCTL, getDirFd(destDir), C.BTRFS_IOC_SNAP_CREATE_V2,
 		uintptr(unsafe.Pointer(&args)))
 	if errno != 0 {
 		return fmt.Errorf("Failed to create btrfs snapshot: %v", errno.Error())
@@ -234,8 +239,8 @@ func subvolSnapshot(src, dest, name string) error {
 }
 
 func isSubvolume(p string) (bool, error) {
-	var bufStat syscall.Stat_t
-	if err := syscall.Lstat(p, &bufStat); err != nil {
+	var bufStat unix.Stat_t
+	if err := unix.Lstat(p, &bufStat); err != nil {
 		return false, err
 	}
 
@@ -287,7 +292,7 @@ func subvolDelete(dirpath, name string, quotaEnabled bool) error {
 			var args C.struct_btrfs_ioctl_qgroup_create_args
 			args.qgroupid = C.__u64(qgroupid)
 
-			_, _, errno := syscall.Syscall(syscall.SYS_IOCTL, getDirFd(dir), C.BTRFS_IOC_QGROUP_CREATE,
+			_, _, errno := unix.Syscall(unix.SYS_IOCTL, getDirFd(dir), C.BTRFS_IOC_QGROUP_CREATE,
 				uintptr(unsafe.Pointer(&args)))
 			if errno != 0 {
 				logrus.Errorf("Failed to delete btrfs qgroup %v for %s: %v", qgroupid, fullPath, errno.Error())
@@ -302,7 +307,7 @@ func subvolDelete(dirpath, name string, quotaEnabled bool) error {
 	for i, c := range []byte(name) {
 		args.name[i] = C.char(c)
 	}
-	_, _, errno := syscall.Syscall(syscall.SYS_IOCTL, getDirFd(dir), C.BTRFS_IOC_SNAP_DESTROY,
+	_, _, errno := unix.Syscall(unix.SYS_IOCTL, getDirFd(dir), C.BTRFS_IOC_SNAP_DESTROY,
 		uintptr(unsafe.Pointer(&args)))
 	if errno != 0 {
 		return fmt.Errorf("Failed to destroy btrfs snapshot %s for %s: %v", dirpath, name, errno.Error())
@@ -338,7 +343,7 @@ func (d *Driver) subvolEnableQuota() error {
 
 	var args C.struct_btrfs_ioctl_quota_ctl_args
 	args.cmd = C.BTRFS_QUOTA_CTL_ENABLE
-	_, _, errno := syscall.Syscall(syscall.SYS_IOCTL, getDirFd(dir), C.BTRFS_IOC_QUOTA_CTL,
+	_, _, errno := unix.Syscall(unix.SYS_IOCTL, getDirFd(dir), C.BTRFS_IOC_QUOTA_CTL,
 		uintptr(unsafe.Pointer(&args)))
 	if errno != 0 {
 		return fmt.Errorf("Failed to enable btrfs quota for %s: %v", dir, errno.Error())
@@ -364,7 +369,7 @@ func (d *Driver) subvolDisableQuota() error {
 
 	var args C.struct_btrfs_ioctl_quota_ctl_args
 	args.cmd = C.BTRFS_QUOTA_CTL_DISABLE
-	_, _, errno := syscall.Syscall(syscall.SYS_IOCTL, getDirFd(dir), C.BTRFS_IOC_QUOTA_CTL,
+	_, _, errno := unix.Syscall(unix.SYS_IOCTL, getDirFd(dir), C.BTRFS_IOC_QUOTA_CTL,
 		uintptr(unsafe.Pointer(&args)))
 	if errno != 0 {
 		return fmt.Errorf("Failed to disable btrfs quota for %s: %v", dir, errno.Error())
@@ -389,7 +394,7 @@ func (d *Driver) subvolRescanQuota() error {
 	defer closeDir(dir)
 
 	var args C.struct_btrfs_ioctl_quota_rescan_args
-	_, _, errno := syscall.Syscall(syscall.SYS_IOCTL, getDirFd(dir), C.BTRFS_IOC_QUOTA_RESCAN_WAIT,
+	_, _, errno := unix.Syscall(unix.SYS_IOCTL, getDirFd(dir), C.BTRFS_IOC_QUOTA_RESCAN_WAIT,
 		uintptr(unsafe.Pointer(&args)))
 	if errno != 0 {
 		return fmt.Errorf("Failed to rescan btrfs quota for %s: %v", dir, errno.Error())
@@ -408,7 +413,7 @@ func subvolLimitQgroup(path string, size uint64) error {
 	var args C.struct_btrfs_ioctl_qgroup_limit_args
 	args.lim.max_referenced = C.__u64(size)
 	args.lim.flags = C.BTRFS_QGROUP_LIMIT_MAX_RFER
-	_, _, errno := syscall.Syscall(syscall.SYS_IOCTL, getDirFd(dir), C.BTRFS_IOC_QGROUP_LIMIT,
+	_, _, errno := unix.Syscall(unix.SYS_IOCTL, getDirFd(dir), C.BTRFS_IOC_QGROUP_LIMIT,
 		uintptr(unsafe.Pointer(&args)))
 	if errno != 0 {
 		return fmt.Errorf("Failed to limit qgroup for %s: %v", dir, errno.Error())
@@ -437,7 +442,7 @@ func subvolQgroupStatus(path string) error {
 	args.key.max_transid = C.__u64(math.MaxUint64)
 	args.key.nr_items = 4096
 
-	_, _, errno := syscall.Syscall(syscall.SYS_IOCTL, getDirFd(dir), C.BTRFS_IOC_TREE_SEARCH,
+	_, _, errno := unix.Syscall(unix.SYS_IOCTL, getDirFd(dir), C.BTRFS_IOC_TREE_SEARCH,
 		uintptr(unsafe.Pointer(&args)))
 	if errno != 0 {
 		return fmt.Errorf("Failed to search qgroup for %s: %v", path, errno.Error())
@@ -459,7 +464,7 @@ func subvolLookupQgroup(path string) (uint64, error) {
 	var args C.struct_btrfs_ioctl_ino_lookup_args
 	args.objectid = C.BTRFS_FIRST_FREE_OBJECTID
 
-	_, _, errno := syscall.Syscall(syscall.SYS_IOCTL, getDirFd(dir), C.BTRFS_IOC_INO_LOOKUP,
+	_, _, errno := unix.Syscall(unix.SYS_IOCTL, getDirFd(dir), C.BTRFS_IOC_INO_LOOKUP,
 		uintptr(unsafe.Pointer(&args)))
 	if errno != 0 {
 		return 0, fmt.Errorf("Failed to lookup qgroup for %s: %v", dir, errno.Error())
@@ -501,7 +506,7 @@ func (d *Driver) Create(id, parent string, opts *graphdriver.CreateOpts) error {
 	if err != nil {
 		return err
 	}
-	if err := idtools.MkdirAllAs(subvolumes, 0700, rootUID, rootGID); err != nil {
+	if err := idtools.MkdirAllAndChown(subvolumes, 0700, idtools.IDPair{UID: rootUID, GID: rootGID}); err != nil {
 		return err
 	}
 	if parent == "" {
@@ -536,7 +541,7 @@ func (d *Driver) Create(id, parent string, opts *graphdriver.CreateOpts) error {
 		if err := d.setStorageSize(path.Join(subvolumes, id), driver); err != nil {
 			return err
 		}
-		if err := idtools.MkdirAllAs(quotas, 0700, rootUID, rootGID); err != nil {
+		if err := idtools.MkdirAllAndChown(quotas, 0700, idtools.IDPair{UID: rootUID, GID: rootGID}); err != nil {
 			return err
 		}
 		if err := ioutil.WriteFile(path.Join(quotas, id), []byte(fmt.Sprint(driver.options.size)), 0644); err != nil {
@@ -588,16 +593,10 @@ func (d *Driver) setStorageSize(dir string, driver *Driver) error {
 	if d.options.minSpace > 0 && driver.options.size < d.options.minSpace {
 		return fmt.Errorf("btrfs: storage size cannot be less than %s", units.HumanSize(float64(d.options.minSpace)))
 	}
-
 	if err := d.subvolEnableQuota(); err != nil {
 		return err
 	}
-
-	if err := subvolLimitQgroup(dir, driver.options.size); err != nil {
-		return err
-	}
-
-	return nil
+	return subvolLimitQgroup(dir, driver.options.size)
 }
 
 // Remove the filesystem with given id.
@@ -624,36 +623,33 @@ func (d *Driver) Remove(id string) error {
 	if err := system.EnsureRemoveAll(dir); err != nil {
 		return err
 	}
-	if err := d.subvolRescanQuota(); err != nil {
-		return err
-	}
-	return nil
+	return d.subvolRescanQuota()
 }
 
 // Get the requested filesystem id.
-func (d *Driver) Get(id, mountLabel string) (string, error) {
+func (d *Driver) Get(id, mountLabel string) (containerfs.ContainerFS, error) {
 	dir := d.subvolumesDirID(id)
 	st, err := os.Stat(dir)
 	if err != nil {
-		return "", err
+		return nil, err
 	}
 
 	if !st.IsDir() {
-		return "", fmt.Errorf("%s: not a directory", dir)
+		return nil, fmt.Errorf("%s: not a directory", dir)
 	}
 
 	if quota, err := ioutil.ReadFile(d.quotasDirID(id)); err == nil {
 		if size, err := strconv.ParseUint(string(quota), 10, 64); err == nil && size >= d.options.minSpace {
 			if err := d.subvolEnableQuota(); err != nil {
-				return "", err
+				return nil, err
 			}
 			if err := subvolLimitQgroup(dir, size); err != nil {
-				return "", err
+				return nil, err
 			}
 		}
 	}
 
-	return dir, nil
+	return containerfs.NewLocalContainerFS(dir), nil
 }
 
 // Put is not implemented for BTRFS as there is no cleanup required for the id.

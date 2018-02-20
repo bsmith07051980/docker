@@ -6,12 +6,9 @@ import (
 	"encoding/json"
 	"fmt"
 	"net"
-	"os"
 	"sort"
 	"sync"
 
-	"github.com/Sirupsen/logrus"
-	"github.com/docker/docker/pkg/stringid"
 	"github.com/docker/go-events"
 	"github.com/docker/libnetwork/cluster"
 	"github.com/docker/libnetwork/datastore"
@@ -20,6 +17,7 @@ import (
 	"github.com/docker/libnetwork/networkdb"
 	"github.com/docker/libnetwork/types"
 	"github.com/gogo/protobuf/proto"
+	"github.com/sirupsen/logrus"
 )
 
 const (
@@ -165,13 +163,13 @@ func (c *controller) handleKeyChange(keys []*types.EncryptionKey) error {
 		a.networkDB.SetKey(added)
 	}
 
-	key, tag, err := c.getPrimaryKeyTag(subsysGossip)
+	key, _, err := c.getPrimaryKeyTag(subsysGossip)
 	if err != nil {
 		return err
 	}
 	a.networkDB.SetPrimaryKey(key)
 
-	key, tag, err = c.getPrimaryKeyTag(subsysIPSec)
+	key, tag, err := c.getPrimaryKeyTag(subsysIPSec)
 	if err != nil {
 		return err
 	}
@@ -214,8 +212,8 @@ func (c *controller) agentSetup(clusterProvider cluster.Provider) error {
 	listen := clusterProvider.GetListenAddress()
 	listenAddr, _, _ := net.SplitHostPort(listen)
 
-	logrus.Infof("Initializing Libnetwork Agent Listen-Addr=%s Local-addr=%s Adv-addr=%s Data-addr=%s Remote-addr-list=%v",
-		listenAddr, bindAddr, advAddr, dataAddr, remoteAddrList)
+	logrus.Infof("Initializing Libnetwork Agent Listen-Addr=%s Local-addr=%s Adv-addr=%s Data-addr=%s Remote-addr-list=%v MTU=%d",
+		listenAddr, bindAddr, advAddr, dataAddr, remoteAddrList, c.Config().Daemon.NetworkControlPlaneMTU)
 	if advAddr != "" && agent == nil {
 		if err := c.agentInit(listenAddr, bindAddr, advAddr, dataAddr); err != nil {
 			logrus.Errorf("error in agentInit: %v", err)
@@ -282,20 +280,25 @@ func (c *controller) agentInit(listenAddr, bindAddrOrInterface, advertiseAddr, d
 	}
 
 	keys, _ := c.getKeys(subsysGossip)
-	hostname, _ := os.Hostname()
-	nodeName := hostname + "-" + stringid.TruncateID(stringid.GenerateRandomID())
-	logrus.Info("Gossip cluster hostname ", nodeName)
 
-	nDB, err := networkdb.New(&networkdb.Config{
-		BindAddr:      listenAddr,
-		AdvertiseAddr: advertiseAddr,
-		NodeName:      nodeName,
-		Keys:          keys,
-	})
-
+	netDBConf := networkdb.DefaultConfig()
+	netDBConf.BindAddr = listenAddr
+	netDBConf.AdvertiseAddr = advertiseAddr
+	netDBConf.Keys = keys
+	if c.Config().Daemon.NetworkControlPlaneMTU != 0 {
+		// Consider the MTU remove the IP hdr (IPv4 or IPv6) and the TCP/UDP hdr.
+		// To be on the safe side let's cut 100 bytes
+		netDBConf.PacketBufferSize = (c.Config().Daemon.NetworkControlPlaneMTU - 100)
+		logrus.Debugf("Control plane MTU: %d will initialize NetworkDB with: %d",
+			c.Config().Daemon.NetworkControlPlaneMTU, netDBConf.PacketBufferSize)
+	}
+	nDB, err := networkdb.New(netDBConf)
 	if err != nil {
 		return err
 	}
+
+	// Register the diagnostic handlers
+	c.DiagnosticServer.RegisterHandler(nDB, networkdb.NetDbPaths2Func)
 
 	var cancelList []func()
 	ch, cancel := nDB.Watch(libnetworkEPTable, "", "")
@@ -383,15 +386,11 @@ func (c *controller) agentClose() {
 
 	agent.Lock()
 	for _, cancelFuncs := range agent.driverCancelFuncs {
-		for _, cancel := range cancelFuncs {
-			cancelList = append(cancelList, cancel)
-		}
+		cancelList = append(cancelList, cancelFuncs...)
 	}
 
 	// Add also the cancel functions for the network db
-	for _, cancel := range agent.coreCancelFuncs {
-		cancelList = append(cancelList, cancel)
-	}
+	cancelList = append(cancelList, agent.coreCancelFuncs...)
 	agent.Unlock()
 
 	for _, cancel := range cancelList {
@@ -439,7 +438,7 @@ func (n *network) Services() map[string]ServiceInfo {
 	for eid, value := range entries {
 		var epRec EndpointRecord
 		nid := n.ID()
-		if err := proto.Unmarshal(value.([]byte), &epRec); err != nil {
+		if err := proto.Unmarshal(value.Value, &epRec); err != nil {
 			logrus.Errorf("Unmarshal of libnetworkEPTable failed for endpoint %s in network %s, %v", eid, nid, err)
 			continue
 		}
@@ -464,7 +463,7 @@ func (n *network) Services() map[string]ServiceInfo {
 		}
 		entries := agent.networkDB.GetTableByNetwork(table.name, n.id)
 		for key, value := range entries {
-			epID, info := d.DecodeTableEntry(table.name, key, value.([]byte))
+			epID, info := d.DecodeTableEntry(table.name, key, value.Value)
 			if ep, ok := eps[epID]; !ok {
 				logrus.Errorf("Inconsistent driver and libnetwork state for endpoint %s", epID)
 			} else {
@@ -648,13 +647,13 @@ func (ep *endpoint) addServiceInfoToCluster(sb *sandbox) error {
 		TaskAliases:  ep.myAliases,
 		EndpointIP:   ep.Iface().Address().IP.String(),
 	})
-
 	if err != nil {
 		return err
 	}
 
 	if agent != nil {
 		if err := agent.networkDB.CreateEntry(libnetworkEPTable, n.ID(), ep.ID(), buf); err != nil {
+			logrus.Warnf("addServiceInfoToCluster NetworkDB CreateEntry failed for %s %s err:%s", ep.id, n.id, err)
 			return err
 		}
 	}
@@ -686,6 +685,13 @@ func (ep *endpoint) deleteServiceInfoFromCluster(sb *sandbox, method string) err
 		name = ep.MyAliases()[0]
 	}
 
+	if agent != nil {
+		// First delete from networkDB then locally
+		if err := agent.networkDB.DeleteEntry(libnetworkEPTable, n.ID(), ep.ID()); err != nil {
+			logrus.Warnf("deleteServiceInfoFromCluster NetworkDB DeleteEntry failed for %s %s err:%s", ep.id, n.id, err)
+		}
+	}
+
 	if ep.Iface().Address() != nil {
 		if ep.svcID != "" {
 			// This is a task part of a service
@@ -693,7 +699,7 @@ func (ep *endpoint) deleteServiceInfoFromCluster(sb *sandbox, method string) err
 			if n.ingress {
 				ingressPorts = ep.ingressPorts
 			}
-			if err := c.rmServiceBinding(ep.svcName, ep.svcID, n.ID(), ep.ID(), name, ep.virtualIP, ingressPorts, ep.svcAliases, ep.myAliases, ep.Iface().Address().IP, "deleteServiceInfoFromCluster"); err != nil {
+			if err := c.rmServiceBinding(ep.svcName, ep.svcID, n.ID(), ep.ID(), name, ep.virtualIP, ingressPorts, ep.svcAliases, ep.myAliases, ep.Iface().Address().IP, "deleteServiceInfoFromCluster", true); err != nil {
 				return err
 			}
 		} else {
@@ -701,12 +707,6 @@ func (ep *endpoint) deleteServiceInfoFromCluster(sb *sandbox, method string) err
 			if err := c.delContainerNameResolution(n.ID(), ep.ID(), name, ep.myAliases, ep.Iface().Address().IP, "deleteServiceInfoFromCluster"); err != nil {
 				return err
 			}
-		}
-	}
-
-	if agent != nil {
-		if err := agent.networkDB.DeleteEntry(libnetworkEPTable, n.ID(), ep.ID()); err != nil {
-			return err
 		}
 	}
 
@@ -737,11 +737,12 @@ func (n *network) addDriverWatches() {
 			return
 		}
 
-		agent.networkDB.WalkTable(table.name, func(nid, key string, value []byte) bool {
-			if nid == n.ID() {
+		agent.networkDB.WalkTable(table.name, func(nid, key string, value []byte, deleted bool) bool {
+			// skip the entries that are mark for deletion, this is safe because this function is
+			// called at initialization time so there is no state to delete
+			if nid == n.ID() && !deleted {
 				d.EventNotify(driverapi.Create, nid, table.name, key, value)
 			}
-
 			return false
 		})
 	}
@@ -883,31 +884,31 @@ func (c *controller) handleEpTableEvent(ev events.Event) {
 	}
 
 	if isAdd {
-		logrus.Debugf("handleEpTableEvent ADD %s R:%v", isAdd, eid, epRec)
+		logrus.Debugf("handleEpTableEvent ADD %s R:%v", eid, epRec)
 		if svcID != "" {
 			// This is a remote task part of a service
 			if err := c.addServiceBinding(svcName, svcID, nid, eid, containerName, vip, ingressPorts, serviceAliases, taskAliases, ip, "handleEpTableEvent"); err != nil {
-				logrus.Errorf("failed adding service binding for %s epRec:%v err:%s", eid, epRec, err)
+				logrus.Errorf("failed adding service binding for %s epRec:%v err:%v", eid, epRec, err)
 				return
 			}
 		} else {
 			// This is a remote container simply attached to an attachable network
 			if err := c.addContainerNameResolution(nid, eid, containerName, taskAliases, ip, "handleEpTableEvent"); err != nil {
-				logrus.Errorf("failed adding service binding for %s epRec:%v err:%s", eid, epRec, err)
+				logrus.Errorf("failed adding container name resolution for %s epRec:%v err:%v", eid, epRec, err)
 			}
 		}
 	} else {
-		logrus.Debugf("handleEpTableEvent DEL %s R:%v", isAdd, eid, epRec)
+		logrus.Debugf("handleEpTableEvent DEL %s R:%v", eid, epRec)
 		if svcID != "" {
 			// This is a remote task part of a service
-			if err := c.rmServiceBinding(svcName, svcID, nid, eid, containerName, vip, ingressPorts, serviceAliases, taskAliases, ip, "handleEpTableEvent"); err != nil {
-				logrus.Errorf("failed removing service binding for %s epRec:%v err:%s", eid, epRec, err)
+			if err := c.rmServiceBinding(svcName, svcID, nid, eid, containerName, vip, ingressPorts, serviceAliases, taskAliases, ip, "handleEpTableEvent", true); err != nil {
+				logrus.Errorf("failed removing service binding for %s epRec:%v err:%v", eid, epRec, err)
 				return
 			}
 		} else {
 			// This is a remote container simply attached to an attachable network
 			if err := c.delContainerNameResolution(nid, eid, containerName, taskAliases, ip, "handleEpTableEvent"); err != nil {
-				logrus.Errorf("failed adding service binding for %s epRec:%v err:%s", eid, epRec, err)
+				logrus.Errorf("failed removing container name resolution for %s epRec:%v err:%v", eid, epRec, err)
 			}
 		}
 	}

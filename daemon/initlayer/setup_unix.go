@@ -1,14 +1,15 @@
 // +build linux freebsd
 
-package initlayer
+package initlayer // import "github.com/docker/docker/daemon/initlayer"
 
 import (
 	"os"
 	"path/filepath"
 	"strings"
-	"syscall"
 
+	"github.com/docker/docker/pkg/containerfs"
 	"github.com/docker/docker/pkg/idtools"
+	"golang.org/x/sys/unix"
 )
 
 // Setup populates a directory with mountpoints suitable
@@ -16,7 +17,10 @@ import (
 //
 // This extra layer is used by all containers as the top-most ro layer. It protects
 // the container from unwanted side-effects on the rw layer.
-func Setup(initLayer string, rootIDs idtools.IDPair) error {
+func Setup(initLayerFs containerfs.ContainerFS, rootIDs idtools.IDPair) error {
+	// Since all paths are local to the container, we can just extract initLayerFs.Path()
+	initLayer := initLayerFs.Path()
+
 	for pth, typ := range map[string]string{
 		"/dev/pts":         "dir",
 		"/dev/shm":         "dir",
@@ -33,7 +37,7 @@ func Setup(initLayer string, rootIDs idtools.IDPair) error {
 		prev := "/"
 		for _, p := range parts[1:] {
 			prev = filepath.Join(prev, p)
-			syscall.Unlink(filepath.Join(initLayer, prev))
+			unix.Unlink(filepath.Join(initLayer, prev))
 		}
 
 		if _, err := os.Stat(filepath.Join(initLayer, pth)); err != nil {

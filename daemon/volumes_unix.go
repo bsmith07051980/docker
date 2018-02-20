@@ -1,8 +1,6 @@
 // +build !windows
 
-// TODO(amitkris): We need to split this file for solaris.
-
-package daemon
+package daemon // import "github.com/docker/docker/daemon"
 
 import (
 	"encoding/json"
@@ -86,8 +84,13 @@ func (daemon *Daemon) setupMounts(c *container.Container) ([]container.Mount, er
 	// remapped root (user namespaces)
 	rootIDs := daemon.idMappings.RootPair()
 	for _, mount := range netMounts {
-		if err := os.Chown(mount.Source, rootIDs.UID, rootIDs.GID); err != nil {
-			return nil, err
+		// we should only modify ownership of network files within our own container
+		// metadata repository. If the user specifies a mount path external, it is
+		// up to the user to make sure the file has proper ownership for userns
+		if strings.Index(mount.Source, daemon.repository) == 0 {
+			if err := os.Chown(mount.Source, rootIDs.UID, rootIDs.GID); err != nil {
+				return nil, err
+			}
 		}
 	}
 	return append(mounts, netMounts...), nil
@@ -137,6 +140,9 @@ func migrateVolume(id, vfs string) error {
 // verifyVolumesInfo ports volumes configured for the containers pre docker 1.7.
 // It reads the container configuration and creates valid mount points for the old volumes.
 func (daemon *Daemon) verifyVolumesInfo(container *container.Container) error {
+	container.Lock()
+	defer container.Unlock()
+
 	// Inspect old structures only when we're upgrading from old versions
 	// to versions >= 1.7 and the MountPoints has not been populated with volumes data.
 	type volumes struct {
@@ -177,7 +183,6 @@ func (daemon *Daemon) verifyVolumesInfo(container *container.Container) error {
 				container.MountPoints[destination] = &m
 			}
 		}
-		return container.ToDisk()
 	}
 	return nil
 }

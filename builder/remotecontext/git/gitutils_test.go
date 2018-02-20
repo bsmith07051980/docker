@@ -1,4 +1,4 @@
-package git
+package git // import "github.com/docker/docker/builder/remotecontext/git"
 
 import (
 	"fmt"
@@ -7,6 +7,7 @@ import (
 	"net/http/httptest"
 	"net/url"
 	"os"
+	"os/exec"
 	"path/filepath"
 	"runtime"
 	"strings"
@@ -15,6 +16,38 @@ import (
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 )
+
+func TestParseRemoteURL(t *testing.T) {
+	dir, err := parseRemoteURL("git://github.com/user/repo.git")
+	require.NoError(t, err)
+	assert.NotEmpty(t, dir)
+	assert.Equal(t, gitRepo{"git://github.com/user/repo.git", "master", ""}, dir)
+
+	dir, err = parseRemoteURL("git://github.com/user/repo.git#mybranch:mydir/mysubdir/")
+	require.NoError(t, err)
+	assert.NotEmpty(t, dir)
+	assert.Equal(t, gitRepo{"git://github.com/user/repo.git", "mybranch", "mydir/mysubdir/"}, dir)
+
+	dir, err = parseRemoteURL("https://github.com/user/repo.git")
+	require.NoError(t, err)
+	assert.NotEmpty(t, dir)
+	assert.Equal(t, gitRepo{"https://github.com/user/repo.git", "master", ""}, dir)
+
+	dir, err = parseRemoteURL("https://github.com/user/repo.git#mybranch:mydir/mysubdir/")
+	require.NoError(t, err)
+	assert.NotEmpty(t, dir)
+	assert.Equal(t, gitRepo{"https://github.com/user/repo.git", "mybranch", "mydir/mysubdir/"}, dir)
+
+	dir, err = parseRemoteURL("git@github.com:user/repo.git")
+	require.NoError(t, err)
+	assert.NotEmpty(t, dir)
+	assert.Equal(t, gitRepo{"git@github.com:user/repo.git", "master", ""}, dir)
+
+	dir, err = parseRemoteURL("git@github.com:user/repo.git#mybranch:mydir/mysubdir/")
+	require.NoError(t, err)
+	assert.NotEmpty(t, dir)
+	assert.Equal(t, gitRepo{"git@github.com:user/repo.git", "mybranch", "mydir/mysubdir/"}, dir)
+}
 
 func TestCloneArgsSmartHttp(t *testing.T) {
 	mux := http.NewServeMux()
@@ -28,8 +61,8 @@ func TestCloneArgsSmartHttp(t *testing.T) {
 		w.Header().Set("Content-Type", fmt.Sprintf("application/x-%s-advertisement", q))
 	})
 
-	args := fetchArgs(serverURL, "master")
-	exp := []string{"fetch", "--recurse-submodules=yes", "--depth", "1", "origin", "master"}
+	args := fetchArgs(serverURL.String(), "master")
+	exp := []string{"fetch", "--depth", "1", "origin", "master"}
 	assert.Equal(t, exp, args)
 }
 
@@ -44,15 +77,14 @@ func TestCloneArgsDumbHttp(t *testing.T) {
 		w.Header().Set("Content-Type", "text/plain")
 	})
 
-	args := fetchArgs(serverURL, "master")
-	exp := []string{"fetch", "--recurse-submodules=yes", "origin", "master"}
+	args := fetchArgs(serverURL.String(), "master")
+	exp := []string{"fetch", "origin", "master"}
 	assert.Equal(t, exp, args)
 }
 
 func TestCloneArgsGit(t *testing.T) {
-	u, _ := url.Parse("git://github.com/docker/docker")
-	args := fetchArgs(u, "master")
-	exp := []string{"fetch", "--recurse-submodules=yes", "--depth", "1", "origin", "master"}
+	args := fetchArgs("git://github.com/docker/docker", "master")
+	exp := []string{"fetch", "--depth", "1", "origin", "master"}
 	assert.Equal(t, exp, args)
 }
 
@@ -134,24 +166,55 @@ func TestCheckoutGit(t *testing.T) {
 	_, err = gitWithinDir(gitDir, "checkout", "master")
 	require.NoError(t, err)
 
+	// set up submodule
+	subrepoDir := filepath.Join(root, "subrepo")
+	_, err = git("init", subrepoDir)
+	require.NoError(t, err)
+
+	_, err = gitWithinDir(subrepoDir, "config", "user.email", "test@docker.com")
+	require.NoError(t, err)
+
+	_, err = gitWithinDir(subrepoDir, "config", "user.name", "Docker test")
+	require.NoError(t, err)
+
+	err = ioutil.WriteFile(filepath.Join(subrepoDir, "subfile"), []byte("subcontents"), 0644)
+	require.NoError(t, err)
+
+	_, err = gitWithinDir(subrepoDir, "add", "-A")
+	require.NoError(t, err)
+
+	_, err = gitWithinDir(subrepoDir, "commit", "-am", "Subrepo initial")
+	require.NoError(t, err)
+
+	cmd := exec.Command("git", "submodule", "add", subrepoDir, "sub") // this command doesn't work with --work-tree
+	cmd.Dir = gitDir
+	require.NoError(t, cmd.Run())
+
+	_, err = gitWithinDir(gitDir, "add", "-A")
+	require.NoError(t, err)
+
+	_, err = gitWithinDir(gitDir, "commit", "-am", "With submodule")
+	require.NoError(t, err)
+
 	type singleCase struct {
-		frag string
-		exp  string
-		fail bool
+		frag      string
+		exp       string
+		fail      bool
+		submodule bool
 	}
 
 	cases := []singleCase{
-		{"", "FROM scratch", false},
-		{"master", "FROM scratch", false},
-		{":subdir", "FROM scratch" + eol + "EXPOSE 5000", false},
-		{":nosubdir", "", true},   // missing directory error
-		{":Dockerfile", "", true}, // not a directory error
-		{"master:nosubdir", "", true},
-		{"master:subdir", "FROM scratch" + eol + "EXPOSE 5000", false},
-		{"master:../subdir", "", true},
-		{"test", "FROM scratch" + eol + "EXPOSE 3000", false},
-		{"test:", "FROM scratch" + eol + "EXPOSE 3000", false},
-		{"test:subdir", "FROM busybox" + eol + "EXPOSE 5000", false},
+		{"", "FROM scratch", false, true},
+		{"master", "FROM scratch", false, true},
+		{":subdir", "FROM scratch" + eol + "EXPOSE 5000", false, false},
+		{":nosubdir", "", true, false},   // missing directory error
+		{":Dockerfile", "", true, false}, // not a directory error
+		{"master:nosubdir", "", true, false},
+		{"master:subdir", "FROM scratch" + eol + "EXPOSE 5000", false, false},
+		{"master:../subdir", "", true, false},
+		{"test", "FROM scratch" + eol + "EXPOSE 3000", false, false},
+		{"test:", "FROM scratch" + eol + "EXPOSE 3000", false, false},
+		{"test:subdir", "FROM busybox" + eol + "EXPOSE 5000", false, false},
 	}
 
 	if runtime.GOOS != "windows" {
@@ -166,15 +229,53 @@ func TestCheckoutGit(t *testing.T) {
 
 	for _, c := range cases {
 		ref, subdir := getRefAndSubdir(c.frag)
-		r, err := checkoutGit(gitDir, ref, subdir)
+		r, err := cloneGitRepo(gitRepo{remote: gitDir, ref: ref, subdir: subdir})
 
 		if c.fail {
 			assert.Error(t, err)
 			continue
 		}
+		require.NoError(t, err)
+		defer os.RemoveAll(r)
+		if c.submodule {
+			b, err := ioutil.ReadFile(filepath.Join(r, "sub/subfile"))
+			require.NoError(t, err)
+			assert.Equal(t, "subcontents", string(b))
+		} else {
+			_, err := os.Stat(filepath.Join(r, "sub/subfile"))
+			require.Error(t, err)
+			require.True(t, os.IsNotExist(err))
+		}
 
 		b, err := ioutil.ReadFile(filepath.Join(r, "Dockerfile"))
 		require.NoError(t, err)
 		assert.Equal(t, c.exp, string(b))
+	}
+}
+
+func TestValidGitTransport(t *testing.T) {
+	gitUrls := []string{
+		"git://github.com/docker/docker",
+		"git@github.com:docker/docker.git",
+		"git@bitbucket.org:atlassianlabs/atlassian-docker.git",
+		"https://github.com/docker/docker.git",
+		"http://github.com/docker/docker.git",
+		"http://github.com/docker/docker.git#branch",
+		"http://github.com/docker/docker.git#:dir",
+	}
+	incompleteGitUrls := []string{
+		"github.com/docker/docker",
+	}
+
+	for _, url := range gitUrls {
+		if !isGitTransport(url) {
+			t.Fatalf("%q should be detected as valid Git prefix", url)
+		}
+	}
+
+	for _, url := range incompleteGitUrls {
+		if isGitTransport(url) {
+			t.Fatalf("%q should not be detected as valid Git prefix", url)
+		}
 	}
 }

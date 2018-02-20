@@ -1,4 +1,4 @@
-package client
+package client // import "github.com/docker/docker/client"
 
 import (
 	"bytes"
@@ -112,7 +112,7 @@ func TestServiceCreateCompatiblePlatforms(t *testing.T) {
 		}),
 	}
 
-	spec := swarm.ServiceSpec{TaskTemplate: swarm.TaskSpec{ContainerSpec: swarm.ContainerSpec{Image: "foobar:1.0"}}}
+	spec := swarm.ServiceSpec{TaskTemplate: swarm.TaskSpec{ContainerSpec: &swarm.ContainerSpec{Image: "foobar:1.0"}}}
 
 	r, err := client.ServiceCreate(context.Background(), spec, types.ServiceCreateOptions{QueryRegistry: true})
 	assert.NoError(t, err)
@@ -189,7 +189,7 @@ func TestServiceCreateDigestPinning(t *testing.T) {
 	for _, p := range pinByDigestTests {
 		r, err := client.ServiceCreate(context.Background(), swarm.ServiceSpec{
 			TaskTemplate: swarm.TaskSpec{
-				ContainerSpec: swarm.ContainerSpec{
+				ContainerSpec: &swarm.ContainerSpec{
 					Image: p.img,
 				},
 			},

@@ -56,7 +56,7 @@ make BUILDTAGS='seccomp apparmor'
 |-----------|------------------------------------|-------------|
 | seccomp   | Syscall filtering                  | libseccomp  |
 | selinux   | selinux process and mount labeling | <none>      |
-| apparmor  | apparmor profile support           | libapparmor |
+| apparmor  | apparmor profile support           | <none>      |
 | ambient   | ambient capability support         | kernel 4.3  |
 
 
@@ -145,11 +145,33 @@ Your process field in the `config.json` should look like this below with `"termi
                         "TERM=xterm"
                 ],
                 "cwd": "/",
-                "capabilities": [
-                        "CAP_AUDIT_WRITE",
-                        "CAP_KILL",
-                        "CAP_NET_BIND_SERVICE"
-                ],
+                "capabilities": {
+                        "bounding": [
+                                "CAP_AUDIT_WRITE",
+                                "CAP_KILL",
+                                "CAP_NET_BIND_SERVICE"
+                        ],
+                        "effective": [
+                                "CAP_AUDIT_WRITE",
+                                "CAP_KILL",
+                                "CAP_NET_BIND_SERVICE"
+                        ],
+                        "inheritable": [
+                                "CAP_AUDIT_WRITE",
+                                "CAP_KILL",
+                                "CAP_NET_BIND_SERVICE"
+                        ],
+                        "permitted": [
+                                "CAP_AUDIT_WRITE",
+                                "CAP_KILL",
+                                "CAP_NET_BIND_SERVICE"
+                        ],
+                        "ambient": [
+                                "CAP_AUDIT_WRITE",
+                                "CAP_KILL",
+                                "CAP_NET_BIND_SERVICE"
+                        ]
+                },
                 "rlimits": [
                         {
                                 "type": "RLIMIT_NOFILE",
@@ -161,7 +183,7 @@ Your process field in the `config.json` should look like this below with `"termi
         },
 ```
 
-Now we can go though the lifecycle operations in your shell.
+Now we can go through the lifecycle operations in your shell.
 
 
 ```bash

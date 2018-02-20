@@ -3,10 +3,10 @@ package main
 import (
 	"testing"
 
-	"github.com/Sirupsen/logrus"
 	"github.com/docker/docker/daemon/config"
-	"github.com/docker/docker/pkg/testutil"
-	"github.com/docker/docker/pkg/testutil/tempfile"
+	"github.com/docker/docker/internal/testutil"
+	"github.com/gotestyourself/gotestyourself/fs"
+	"github.com/sirupsen/logrus"
 	"github.com/spf13/pflag"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
@@ -46,9 +46,9 @@ func TestLoadDaemonCliConfigWithTLS(t *testing.T) {
 }
 
 func TestLoadDaemonCliConfigWithConflicts(t *testing.T) {
-	tempFile := tempfile.NewTempFile(t, "config", `{"labels": ["l3=foo"]}`)
+	tempFile := fs.NewFile(t, "config", fs.WithContent(`{"labels": ["l3=foo"]}`))
 	defer tempFile.Remove()
-	configFile := tempFile.Name()
+	configFile := tempFile.Path()
 
 	opts := defaultOptions(configFile)
 	flags := opts.flags
@@ -61,11 +61,49 @@ func TestLoadDaemonCliConfigWithConflicts(t *testing.T) {
 	testutil.ErrorContains(t, err, "as a flag and in the configuration file: labels")
 }
 
+func TestLoadDaemonCliWithConflictingNodeGenericResources(t *testing.T) {
+	tempFile := fs.NewFile(t, "config", fs.WithContent(`{"node-generic-resources": ["foo=bar", "bar=baz"]}`))
+	defer tempFile.Remove()
+	configFile := tempFile.Path()
+
+	opts := defaultOptions(configFile)
+	flags := opts.flags
+
+	assert.NoError(t, flags.Set("config-file", configFile))
+	assert.NoError(t, flags.Set("node-generic-resource", "r1=bar"))
+	assert.NoError(t, flags.Set("node-generic-resource", "r2=baz"))
+
+	_, err := loadDaemonCliConfig(opts)
+	testutil.ErrorContains(t, err, "as a flag and in the configuration file: node-generic-resources")
+}
+
+func TestLoadDaemonCliWithConflictingLabels(t *testing.T) {
+	opts := defaultOptions("")
+	flags := opts.flags
+
+	assert.NoError(t, flags.Set("label", "foo=bar"))
+	assert.NoError(t, flags.Set("label", "foo=baz"))
+
+	_, err := loadDaemonCliConfig(opts)
+	assert.EqualError(t, err, "conflict labels for foo=baz and foo=bar")
+}
+
+func TestLoadDaemonCliWithDuplicateLabels(t *testing.T) {
+	opts := defaultOptions("")
+	flags := opts.flags
+
+	assert.NoError(t, flags.Set("label", "foo=the-same"))
+	assert.NoError(t, flags.Set("label", "foo=the-same"))
+
+	_, err := loadDaemonCliConfig(opts)
+	assert.NoError(t, err)
+}
+
 func TestLoadDaemonCliConfigWithTLSVerify(t *testing.T) {
-	tempFile := tempfile.NewTempFile(t, "config", `{"tlsverify": true}`)
+	tempFile := fs.NewFile(t, "config", fs.WithContent(`{"tlsverify": true}`))
 	defer tempFile.Remove()
 
-	opts := defaultOptions(tempFile.Name())
+	opts := defaultOptions(tempFile.Path())
 	opts.TLSOptions.CAFile = "/tmp/ca.pem"
 
 	loadedConfig, err := loadDaemonCliConfig(opts)
@@ -75,10 +113,10 @@ func TestLoadDaemonCliConfigWithTLSVerify(t *testing.T) {
 }
 
 func TestLoadDaemonCliConfigWithExplicitTLSVerifyFalse(t *testing.T) {
-	tempFile := tempfile.NewTempFile(t, "config", `{"tlsverify": false}`)
+	tempFile := fs.NewFile(t, "config", fs.WithContent(`{"tlsverify": false}`))
 	defer tempFile.Remove()
 
-	opts := defaultOptions(tempFile.Name())
+	opts := defaultOptions(tempFile.Path())
 	opts.TLSOptions.CAFile = "/tmp/ca.pem"
 
 	loadedConfig, err := loadDaemonCliConfig(opts)
@@ -88,10 +126,10 @@ func TestLoadDaemonCliConfigWithExplicitTLSVerifyFalse(t *testing.T) {
 }
 
 func TestLoadDaemonCliConfigWithoutTLSVerify(t *testing.T) {
-	tempFile := tempfile.NewTempFile(t, "config", `{}`)
+	tempFile := fs.NewFile(t, "config", fs.WithContent(`{}`))
 	defer tempFile.Remove()
 
-	opts := defaultOptions(tempFile.Name())
+	opts := defaultOptions(tempFile.Path())
 	opts.TLSOptions.CAFile = "/tmp/ca.pem"
 
 	loadedConfig, err := loadDaemonCliConfig(opts)
@@ -101,10 +139,10 @@ func TestLoadDaemonCliConfigWithoutTLSVerify(t *testing.T) {
 }
 
 func TestLoadDaemonCliConfigWithLogLevel(t *testing.T) {
-	tempFile := tempfile.NewTempFile(t, "config", `{"log-level": "warn"}`)
+	tempFile := fs.NewFile(t, "config", fs.WithContent(`{"log-level": "warn"}`))
 	defer tempFile.Remove()
 
-	opts := defaultOptions(tempFile.Name())
+	opts := defaultOptions(tempFile.Path())
 	loadedConfig, err := loadDaemonCliConfig(opts)
 	require.NoError(t, err)
 	require.NotNil(t, loadedConfig)
@@ -114,10 +152,10 @@ func TestLoadDaemonCliConfigWithLogLevel(t *testing.T) {
 
 func TestLoadDaemonConfigWithEmbeddedOptions(t *testing.T) {
 	content := `{"tlscacert": "/etc/certs/ca.pem", "log-driver": "syslog"}`
-	tempFile := tempfile.NewTempFile(t, "config", content)
+	tempFile := fs.NewFile(t, "config", fs.WithContent(content))
 	defer tempFile.Remove()
 
-	opts := defaultOptions(tempFile.Name())
+	opts := defaultOptions(tempFile.Path())
 	loadedConfig, err := loadDaemonCliConfig(opts)
 	require.NoError(t, err)
 	require.NotNil(t, loadedConfig)
@@ -131,10 +169,10 @@ func TestLoadDaemonConfigWithRegistryOptions(t *testing.T) {
 		"registry-mirrors": ["https://mirrors.docker.com"],
 		"insecure-registries": ["https://insecure.docker.com"]
 	}`
-	tempFile := tempfile.NewTempFile(t, "config", content)
+	tempFile := fs.NewFile(t, "config", fs.WithContent(content))
 	defer tempFile.Remove()
 
-	opts := defaultOptions(tempFile.Name())
+	opts := defaultOptions(tempFile.Path())
 	loadedConfig, err := loadDaemonCliConfig(opts)
 	require.NoError(t, err)
 	require.NotNil(t, loadedConfig)

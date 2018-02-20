@@ -1,12 +1,11 @@
-// +build windows
-
-package container
+package container // import "github.com/docker/docker/container"
 
 import (
 	"fmt"
 	"os"
 	"path/filepath"
 
+	"github.com/docker/docker/api/types"
 	containertypes "github.com/docker/docker/api/types/container"
 	"github.com/docker/docker/pkg/system"
 )
@@ -15,17 +14,15 @@ const (
 	containerSecretMountPath         = `C:\ProgramData\Docker\secrets`
 	containerInternalSecretMountPath = `C:\ProgramData\Docker\internal\secrets`
 	containerInternalConfigsDirPath  = `C:\ProgramData\Docker\internal\configs`
+
+	// DefaultStopTimeout is the timeout (in seconds) for the shutdown call on a container
+	DefaultStopTimeout = 30
 )
 
-// ExitStatus provides exit reasons for a container.
-type ExitStatus struct {
-	// The exit code with which the container exited.
-	ExitCode int
-}
-
-// UnmountIpcMounts unmounts Ipc related mounts.
+// UnmountIpcMount unmounts Ipc related mounts.
 // This is a NOOP on windows.
-func (container *Container) UnmountIpcMounts(unmount func(pth string) error) {
+func (container *Container) UnmountIpcMount(unmount func(pth string) error) error {
+	return nil
 }
 
 // IpcMounts returns the list of Ipc related mounts.
@@ -57,22 +54,30 @@ func (container *Container) CreateSecretSymlinks() error {
 // SecretMounts returns the mount for the secret path.
 // All secrets are stored in a single mount on Windows. Target symlinks are
 // created for each secret, pointing to the files in this mount.
-func (container *Container) SecretMounts() []Mount {
+func (container *Container) SecretMounts() ([]Mount, error) {
 	var mounts []Mount
 	if len(container.SecretReferences) > 0 {
+		src, err := container.SecretMountPath()
+		if err != nil {
+			return nil, err
+		}
 		mounts = append(mounts, Mount{
-			Source:      container.SecretMountPath(),
+			Source:      src,
 			Destination: containerInternalSecretMountPath,
 			Writable:    false,
 		})
 	}
 
-	return mounts
+	return mounts, nil
 }
 
 // UnmountSecrets unmounts the fs for secrets
 func (container *Container) UnmountSecrets() error {
-	return os.RemoveAll(container.SecretMountPath())
+	p, err := container.SecretMountPath()
+	if err != nil {
+		return err
+	}
+	return os.RemoveAll(p)
 }
 
 // CreateConfigSymlinks creates symlinks to files in the config mount.
@@ -99,17 +104,21 @@ func (container *Container) CreateConfigSymlinks() error {
 // ConfigMounts returns the mount for configs.
 // All configs are stored in a single mount on Windows. Target symlinks are
 // created for each config, pointing to the files in this mount.
-func (container *Container) ConfigMounts() []Mount {
+func (container *Container) ConfigMounts() ([]Mount, error) {
 	var mounts []Mount
 	if len(container.ConfigReferences) > 0 {
+		src, err := container.ConfigsDirPath()
+		if err != nil {
+			return nil, err
+		}
 		mounts = append(mounts, Mount{
-			Source:      container.ConfigsDirPath(),
+			Source:      src,
 			Destination: containerInternalConfigsDirPath,
 			Writable:    false,
 		})
 	}
 
-	return mounts
+	return mounts, nil
 }
 
 // DetachAndUnmount unmounts all volumes.
@@ -125,11 +134,8 @@ func (container *Container) TmpfsMounts() ([]Mount, error) {
 	return mounts, nil
 }
 
-// UpdateContainer updates configuration of a container
+// UpdateContainer updates configuration of a container. Callers must hold a Lock on the Container.
 func (container *Container) UpdateContainer(hostConfig *containertypes.HostConfig) error {
-	container.Lock()
-	defer container.Unlock()
-
 	resources := hostConfig.Resources
 	if resources.CPUShares != 0 ||
 		resources.Memory != 0 ||
@@ -173,18 +179,6 @@ func (container *Container) UpdateContainer(hostConfig *containertypes.HostConfi
 	return nil
 }
 
-// cleanResourcePath cleans a resource path by removing C:\ syntax, and prepares
-// to combine with a volume path
-func cleanResourcePath(path string) string {
-	if len(path) >= 2 {
-		c := path[0]
-		if path[1] == ':' && ('a' <= c && c <= 'z' || 'A' <= c && c <= 'Z') {
-			path = path[2:]
-		}
-	}
-	return filepath.Join(string(os.PathSeparator), path)
-}
-
 // BuildHostnameFile writes the container's hostname file.
 func (container *Container) BuildHostnameFile() error {
 	return nil
@@ -193,4 +187,20 @@ func (container *Container) BuildHostnameFile() error {
 // EnableServiceDiscoveryOnDefaultNetwork Enable service discovery on default network
 func (container *Container) EnableServiceDiscoveryOnDefaultNetwork() bool {
 	return true
+}
+
+// GetMountPoints gives a platform specific transformation to types.MountPoint. Callers must hold a Container lock.
+func (container *Container) GetMountPoints() []types.MountPoint {
+	mountPoints := make([]types.MountPoint, 0, len(container.MountPoints))
+	for _, m := range container.MountPoints {
+		mountPoints = append(mountPoints, types.MountPoint{
+			Type:        m.Type,
+			Name:        m.Name,
+			Source:      m.Path(),
+			Destination: m.Destination,
+			Driver:      m.Driver,
+			RW:          m.RW,
+		})
+	}
+	return mountPoints
 }

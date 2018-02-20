@@ -14,7 +14,6 @@ import (
 	"sync"
 	"time"
 
-	"github.com/Sirupsen/logrus"
 	"github.com/boltdb/bolt"
 	"github.com/docker/docker/pkg/plugingetter"
 	metrics "github.com/docker/go-metrics"
@@ -28,10 +27,10 @@ import (
 	"github.com/docker/swarmkit/manager"
 	"github.com/docker/swarmkit/manager/encryption"
 	"github.com/docker/swarmkit/remotes"
-	"github.com/docker/swarmkit/watch"
 	"github.com/docker/swarmkit/xnet"
 	grpc_prometheus "github.com/grpc-ecosystem/go-grpc-prometheus"
 	"github.com/pkg/errors"
+	"github.com/sirupsen/logrus"
 	"golang.org/x/net/context"
 	"google.golang.org/grpc"
 	"google.golang.org/grpc/codes"
@@ -276,12 +275,13 @@ func (n *Node) run(ctx context.Context) (err error) {
 	}(ctx)
 
 	paths := ca.NewConfigPaths(filepath.Join(n.config.StateDir, certDirectory))
-	securityConfig, err := n.loadSecurityConfig(ctx, paths)
+	securityConfig, secConfigCancel, err := n.loadSecurityConfig(ctx, paths)
 	if err != nil {
 		return err
 	}
+	defer secConfigCancel()
 
-	renewer := ca.NewTLSRenewer(securityConfig, n.connBroker)
+	renewer := ca.NewTLSRenewer(securityConfig, n.connBroker, paths.RootCA)
 
 	ctx = log.WithLogger(ctx, log.G(ctx).WithField("node.id", n.NodeID()))
 
@@ -308,8 +308,6 @@ func (n *Node) run(ctx context.Context) (err error) {
 			case <-agentDone:
 				return
 			case nodeChanges := <-n.notifyNodeChange:
-				currentRole := n.currentRole()
-
 				if nodeChanges.Node != nil {
 					// This is a bit complex to be backward compatible with older CAs that
 					// don't support the Node.Role field. They only use what's presently
@@ -335,10 +333,7 @@ func (n *Node) run(ctx context.Context) (err error) {
 				}
 
 				if nodeChanges.RootCert != nil {
-					// We only want to update the root CA if this is a worker node.  Manager nodes directly watch the raft
-					// store and update the root CA, with the necessary signer, from the raft store (since the managers
-					// need the CA key as well to potentially issue new TLS certificates).
-					if currentRole == api.NodeRoleManager || bytes.Equal(nodeChanges.RootCert, securityConfig.RootCA().Certs) {
+					if bytes.Equal(nodeChanges.RootCert, securityConfig.RootCA().Certs) {
 						continue
 					}
 					newRootCA, err := ca.NewRootCA(nodeChanges.RootCert, nil, nil, ca.DefaultNodeCertExpiration, nil)
@@ -346,7 +341,7 @@ func (n *Node) run(ctx context.Context) (err error) {
 						log.G(ctx).WithError(err).Error("invalid new root certificate from the dispatcher")
 						continue
 					}
-					if err := securityConfig.UpdateRootCA(&newRootCA, newRootCA.Pool); err != nil {
+					if err := securityConfig.UpdateRootCA(&newRootCA); err != nil {
 						log.G(ctx).WithError(err).Error("could not use new root CA from dispatcher")
 						continue
 					}
@@ -509,11 +504,8 @@ waitPeer:
 	default:
 	}
 
-	secChangeQueue := watch.NewQueue()
-	defer secChangeQueue.Close()
-	secChangesCh, secChangesCancel := secChangeQueue.Watch()
+	secChangesCh, secChangesCancel := securityConfig.Watch()
 	defer secChangesCancel()
-	securityConfig.SetWatch(secChangeQueue)
 
 	rootCA := securityConfig.RootCA()
 	issuer := securityConfig.IssuerInfo()
@@ -668,28 +660,31 @@ func (n *Node) Remotes() []api.Peer {
 	return remotes
 }
 
-func (n *Node) loadSecurityConfig(ctx context.Context, paths *ca.SecurityConfigPaths) (*ca.SecurityConfig, error) {
-	var securityConfig *ca.SecurityConfig
+func (n *Node) loadSecurityConfig(ctx context.Context, paths *ca.SecurityConfigPaths) (*ca.SecurityConfig, func() error, error) {
+	var (
+		securityConfig *ca.SecurityConfig
+		cancel         func() error
+	)
 
 	krw := ca.NewKeyReadWriter(paths.Node, n.unlockKey, &manager.RaftDEKData{})
 	if err := krw.Migrate(); err != nil {
-		return nil, err
+		return nil, nil, err
 	}
 
 	// Check if we already have a valid certificates on disk.
 	rootCA, err := ca.GetLocalRootCA(paths.RootCA)
 	if err != nil && err != ca.ErrNoLocalRootCA {
-		return nil, err
+		return nil, nil, err
 	}
 	if err == nil {
 		// if forcing a new cluster, we allow the certificates to be expired - a new set will be generated
-		securityConfig, err = ca.LoadSecurityConfig(ctx, rootCA, krw, n.config.ForceNewCluster)
+		securityConfig, cancel, err = ca.LoadSecurityConfig(ctx, rootCA, krw, n.config.ForceNewCluster)
 		if err != nil {
 			_, isInvalidKEK := errors.Cause(err).(ca.ErrInvalidKEK)
 			if isInvalidKEK {
-				return nil, ErrInvalidUnlockKey
+				return nil, nil, ErrInvalidUnlockKey
 			} else if !os.IsNotExist(err) {
-				return nil, errors.Wrapf(err, "error while loading TLS certificate in %s", paths.Node.Cert)
+				return nil, nil, errors.Wrapf(err, "error while loading TLS certificate in %s", paths.Node.Cert)
 			}
 		}
 	}
@@ -704,16 +699,16 @@ func (n *Node) loadSecurityConfig(ctx context.Context, paths *ca.SecurityConfigP
 			krw = ca.NewKeyReadWriter(paths.Node, n.unlockKey, &manager.RaftDEKData{})
 			rootCA, err = ca.CreateRootCA(ca.DefaultRootCN)
 			if err != nil {
-				return nil, err
+				return nil, nil, err
 			}
 			if err := ca.SaveRootCA(rootCA, paths.RootCA); err != nil {
-				return nil, err
+				return nil, nil, err
 			}
 			log.G(ctx).Debug("generated CA key and certificate")
 		} else if err == ca.ErrNoLocalRootCA { // from previous error loading the root CA from disk
 			rootCA, err = ca.DownloadRootCA(ctx, paths.RootCA, n.config.JoinToken, n.connBroker)
 			if err != nil {
-				return nil, err
+				return nil, nil, err
 			}
 			log.G(ctx).Debug("downloaded CA certificate")
 		}
@@ -724,25 +719,25 @@ func (n *Node) loadSecurityConfig(ctx context.Context, paths *ca.SecurityConfigP
 		// - We wait for CreateSecurityConfig to finish since we need a certificate to operate.
 
 		// Attempt to load certificate from disk
-		securityConfig, err = ca.LoadSecurityConfig(ctx, rootCA, krw, n.config.ForceNewCluster)
+		securityConfig, cancel, err = ca.LoadSecurityConfig(ctx, rootCA, krw, n.config.ForceNewCluster)
 		if err == nil {
 			log.G(ctx).WithFields(logrus.Fields{
 				"node.id": securityConfig.ClientTLSCreds.NodeID(),
 			}).Debugf("loaded TLS certificate")
 		} else {
 			if _, ok := errors.Cause(err).(ca.ErrInvalidKEK); ok {
-				return nil, ErrInvalidUnlockKey
+				return nil, nil, ErrInvalidUnlockKey
 			}
 			log.G(ctx).WithError(err).Debugf("no node credentials found in: %s", krw.Target())
 
-			securityConfig, err = rootCA.CreateSecurityConfig(ctx, krw, ca.CertificateRequestConfig{
+			securityConfig, cancel, err = rootCA.CreateSecurityConfig(ctx, krw, ca.CertificateRequestConfig{
 				Token:        n.config.JoinToken,
 				Availability: n.config.Availability,
 				ConnBroker:   n.connBroker,
 			})
 
 			if err != nil {
-				return nil, err
+				return nil, nil, err
 			}
 		}
 	}
@@ -753,7 +748,7 @@ func (n *Node) loadSecurityConfig(ctx context.Context, paths *ca.SecurityConfigP
 	n.roleCond.Broadcast()
 	n.Unlock()
 
-	return securityConfig, nil
+	return securityConfig, cancel, nil
 }
 
 func (n *Node) initManagerConnection(ctx context.Context, ready chan<- struct{}) error {
@@ -828,14 +823,22 @@ func (n *Node) runManager(ctx context.Context, securityConfig *ca.SecurityConfig
 		}
 	}
 
-	remoteAddr, _ := n.remotes.Select(n.NodeID())
+	joinAddr := n.config.JoinAddr
+	if joinAddr == "" {
+		remoteAddr, err := n.remotes.Select(n.NodeID())
+		if err == nil {
+			joinAddr = remoteAddr.Addr
+		}
+	}
+
 	m, err := manager.New(&manager.Config{
 		ForceNewCluster:  n.config.ForceNewCluster,
 		RemoteAPI:        remoteAPI,
 		ControlAPI:       n.config.ListenControlAPI,
 		SecurityConfig:   securityConfig,
 		ExternalCAs:      n.config.ExternalCAs,
-		JoinRaft:         remoteAddr.Addr,
+		JoinRaft:         joinAddr,
+		ForceJoin:        n.config.JoinAddr != "",
 		StateDir:         n.config.StateDir,
 		HeartbeatTick:    n.config.HeartbeatTick,
 		ElectionTick:     n.config.ElectionTick,
@@ -966,6 +969,15 @@ func (n *Node) superviseManager(ctx context.Context, securityConfig *ca.Security
 
 		ready = nil
 	}
+}
+
+// DowngradeKey reverts the node key to older format so that it can
+// run on older version of swarmkit
+func (n *Node) DowngradeKey() error {
+	paths := ca.NewConfigPaths(filepath.Join(n.config.StateDir, certDirectory))
+	krw := ca.NewKeyReadWriter(paths.Node, n.config.UnlockKey, nil)
+
+	return krw.DowngradeKey()
 }
 
 type persistentRemotes struct {

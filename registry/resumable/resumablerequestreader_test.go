@@ -1,9 +1,7 @@
-package resumable
+package resumable // import "github.com/docker/docker/registry/resumable"
 
 import (
 	"fmt"
-	"github.com/stretchr/testify/assert"
-	"github.com/stretchr/testify/require"
 	"io"
 	"io/ioutil"
 	"net/http"
@@ -11,6 +9,9 @@ import (
 	"strings"
 	"testing"
 	"time"
+
+	"github.com/stretchr/testify/assert"
+	"github.com/stretchr/testify/require"
 )
 
 func TestResumableRequestHeaderSimpleErrors(t *testing.T) {

@@ -1,11 +1,22 @@
 package libnetwork
 
 import (
-	"github.com/Sirupsen/logrus"
 	"github.com/docker/libnetwork/iptables"
+	"github.com/sirupsen/logrus"
 )
 
 const userChain = "DOCKER-USER"
+
+func (c *controller) arrangeUserFilterRule() {
+	c.Lock()
+	arrangeUserFilterRule()
+	c.Unlock()
+	iptables.OnReloaded(func() {
+		c.Lock()
+		arrangeUserFilterRule()
+		c.Unlock()
+	})
+}
 
 // This chain allow users to configure firewall policies in a way that persists
 // docker operations/restarts. Docker will not delete or modify any pre-existing

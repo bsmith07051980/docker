@@ -1,23 +1,20 @@
 // +build linux,cgo
 
-package devicemapper
+package devicemapper // import "github.com/docker/docker/pkg/devicemapper"
 
 import (
 	"errors"
 	"fmt"
 	"os"
 	"runtime"
-	"syscall"
 	"unsafe"
 
-	"github.com/Sirupsen/logrus"
+	"github.com/sirupsen/logrus"
+	"golang.org/x/sys/unix"
 )
 
-// DevmapperLogger defines methods for logging with devicemapper.
-type DevmapperLogger interface {
-	DMLog(level int, file string, line int, dmError int, message string)
-}
-
+// Same as DM_DEVICE_* enum values from libdevmapper.h
+// nolint: deadcode
 const (
 	deviceCreate TaskType = iota
 	deviceReload
@@ -70,12 +67,14 @@ var (
 	ErrBusy                 = errors.New("Device is Busy")
 	ErrDeviceIDExists       = errors.New("Device Id Exists")
 	ErrEnxio                = errors.New("No such device or address")
+	ErrEnoData              = errors.New("No data available")
 )
 
 var (
-	dmSawBusy  bool
-	dmSawExist bool
-	dmSawEnxio bool // No Such Device or Address
+	dmSawBusy    bool
+	dmSawExist   bool
+	dmSawEnxio   bool // No Such Device or Address
+	dmSawEnoData bool // No data available
 )
 
 type (
@@ -264,19 +263,6 @@ func UdevWait(cookie *uint) error {
 	return nil
 }
 
-// LogInitVerbose is an interface to initialize the verbose logger for the device mapper library.
-func LogInitVerbose(level int) {
-	DmLogInitVerbose(level)
-}
-
-var dmLogger DevmapperLogger
-
-// LogInit initializes the logger for the device mapper library.
-func LogInit(logger DevmapperLogger) {
-	dmLogger = logger
-	LogWithErrnoInit()
-}
-
 // SetDevDir sets the dev folder for the device mapper library (usually /dev).
 func SetDevDir(dir string) error {
 	if res := DmSetDevDir(dir); res != 1 {
@@ -336,9 +322,13 @@ func RemoveDevice(name string) error {
 	defer UdevWait(cookie)
 
 	dmSawBusy = false // reset before the task is run
+	dmSawEnxio = false
 	if err = task.run(); err != nil {
 		if dmSawBusy {
 			return ErrBusy
+		}
+		if dmSawEnxio {
+			return ErrEnxio
 		}
 		return fmt.Errorf("devicemapper: Error running RemoveDevice %s", err)
 	}
@@ -363,8 +353,7 @@ func RemoveDeviceDeferred(name string) error {
 	// disable udev dm rules and delete the symlink under /dev/mapper by itself,
 	// even if the removal is deferred by the kernel.
 	cookie := new(uint)
-	var flags uint16
-	flags = DmUdevDisableLibraryFallback
+	flags := uint16(DmUdevDisableLibraryFallback)
 	if err := task.setCookie(cookie, flags); err != nil {
 		return fmt.Errorf("devicemapper: Can not set cookie: %s", err)
 	}
@@ -373,14 +362,18 @@ func RemoveDeviceDeferred(name string) error {
 	// semaphores created in `task.setCookie` will be cleaned up in `UdevWait`.
 	// So these two function call must come in pairs, otherwise semaphores will
 	// be leaked, and the  limit of number of semaphores defined in `/proc/sys/kernel/sem`
-	// will be reached, which will eventually make all follwing calls to 'task.SetCookie'
+	// will be reached, which will eventually make all following calls to 'task.SetCookie'
 	// fail.
 	// this call will not wait for the deferred removal's final executing, since no
 	// udev event will be generated, and the semaphore's value will not be incremented
 	// by udev, what UdevWait is just cleaning up the semaphore.
 	defer UdevWait(cookie)
 
+	dmSawEnxio = false
 	if err = task.run(); err != nil {
+		if dmSawEnxio {
+			return ErrEnxio
+		}
 		return fmt.Errorf("devicemapper: Error running RemoveDeviceDeferred %s", err)
 	}
 
@@ -449,7 +442,7 @@ func BlockDeviceDiscard(path string) error {
 
 	// Without this sometimes the remove of the device that happens after
 	// discard fails with EBUSY.
-	syscall.Sync()
+	unix.Sync()
 
 	return nil
 }
@@ -473,8 +466,7 @@ func CreatePool(poolName string, dataFile, metadataFile *os.File, poolBlockSize 
 	}
 
 	cookie := new(uint)
-	var flags uint16
-	flags = DmUdevDisableSubsystemRulesFlag | DmUdevDisableDiskRulesFlag | DmUdevDisableOtherRulesFlag
+	flags := uint16(DmUdevDisableSubsystemRulesFlag | DmUdevDisableDiskRulesFlag | DmUdevDisableOtherRulesFlag)
 	if err := task.setCookie(cookie, flags); err != nil {
 		return fmt.Errorf("devicemapper: Can't set cookie %s", err)
 	}
@@ -718,9 +710,14 @@ func DeleteDevice(poolName string, deviceID int) error {
 	}
 
 	dmSawBusy = false
+	dmSawEnoData = false
 	if err := task.run(); err != nil {
 		if dmSawBusy {
 			return ErrBusy
+		}
+		if dmSawEnoData {
+			logrus.Debugf("devicemapper: Device(id: %d) from pool(%s) does not exist", deviceID, poolName)
+			return nil
 		}
 		return fmt.Errorf("devicemapper: Error running DeleteDevice %s", err)
 	}

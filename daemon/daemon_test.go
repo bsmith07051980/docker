@@ -1,24 +1,26 @@
-// +build !solaris
-
-package daemon
+package daemon // import "github.com/docker/docker/daemon"
 
 import (
 	"io/ioutil"
 	"os"
 	"path/filepath"
+	"runtime"
 	"testing"
 
 	containertypes "github.com/docker/docker/api/types/container"
 	"github.com/docker/docker/container"
+	"github.com/docker/docker/errdefs"
 	_ "github.com/docker/docker/pkg/discovery/memory"
 	"github.com/docker/docker/pkg/idtools"
-	"github.com/docker/docker/pkg/registrar"
 	"github.com/docker/docker/pkg/truncindex"
 	"github.com/docker/docker/volume"
 	volumedrivers "github.com/docker/docker/volume/drivers"
 	"github.com/docker/docker/volume/local"
 	"github.com/docker/docker/volume/store"
 	"github.com/docker/go-connections/nat"
+	"github.com/docker/libnetwork"
+	"github.com/pkg/errors"
+	"github.com/stretchr/testify/assert"
 )
 
 //
@@ -65,10 +67,15 @@ func TestGetContainer(t *testing.T) {
 	index.Add(c4.ID)
 	index.Add(c5.ID)
 
+	containersReplica, err := container.NewViewDB()
+	if err != nil {
+		t.Fatalf("could not create ViewDB: %v", err)
+	}
+
 	daemon := &Daemon{
-		containers: store,
-		idIndex:    index,
-		nameIndex:  registrar.NewRegistrar(),
+		containers:        store,
+		containersReplica: containersReplica,
+		idIndex:           index,
 	}
 
 	daemon.reserveName(c1.ID, c1.Name)
@@ -298,5 +305,21 @@ func TestMerge(t *testing.T) {
 		if portSpecs.Port() != "0" && portSpecs.Port() != "1111" && portSpecs.Port() != "2222" && portSpecs.Port() != "3333" {
 			t.Fatalf("Expected %q or %q or %q or %q, found %s", 0, 1111, 2222, 3333, portSpecs)
 		}
+	}
+}
+
+func TestValidateContainerIsolation(t *testing.T) {
+	d := Daemon{}
+
+	_, err := d.verifyContainerSettings(runtime.GOOS, &containertypes.HostConfig{Isolation: containertypes.Isolation("invalid")}, nil, false)
+	assert.EqualError(t, err, "invalid isolation 'invalid' on "+runtime.GOOS)
+}
+
+func TestFindNetworkErrorType(t *testing.T) {
+	d := Daemon{}
+	_, err := d.FindNetwork("fakeNet")
+	_, ok := errors.Cause(err).(libnetwork.ErrNoSuchNetwork)
+	if !errdefs.IsNotFound(err) || !ok {
+		assert.Fail(t, "The FindNetwork method MUST always return an error that implements the NotFound interface and is ErrNoSuchNetwork")
 	}
 }

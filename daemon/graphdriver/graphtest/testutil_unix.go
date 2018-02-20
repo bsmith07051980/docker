@@ -1,17 +1,17 @@
 // +build linux freebsd
 
-package graphtest
+package graphtest // import "github.com/docker/docker/daemon/graphdriver/graphtest"
 
 import (
-	"io/ioutil"
 	"os"
-	"path"
 	"syscall"
 	"testing"
 
+	contdriver "github.com/containerd/continuity/driver"
 	"github.com/docker/docker/daemon/graphdriver"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
+	"golang.org/x/sys/unix"
 )
 
 func verifyFile(t testing.TB, path string, mode os.FileMode, uid, gid uint32) {
@@ -33,37 +33,37 @@ func verifyFile(t testing.TB, path string, mode os.FileMode, uid, gid uint32) {
 
 func createBase(t testing.TB, driver graphdriver.Driver, name string) {
 	// We need to be able to set any perms
-	oldmask := syscall.Umask(0)
-	defer syscall.Umask(oldmask)
+	oldmask := unix.Umask(0)
+	defer unix.Umask(oldmask)
 
 	err := driver.CreateReadWrite(name, "", nil)
 	require.NoError(t, err)
 
-	dir, err := driver.Get(name, "")
+	dirFS, err := driver.Get(name, "")
 	require.NoError(t, err)
 	defer driver.Put(name)
 
-	subdir := path.Join(dir, "a subdir")
-	require.NoError(t, os.Mkdir(subdir, 0705|os.ModeSticky))
-	require.NoError(t, os.Chown(subdir, 1, 2))
+	subdir := dirFS.Join(dirFS.Path(), "a subdir")
+	require.NoError(t, dirFS.Mkdir(subdir, 0705|os.ModeSticky))
+	require.NoError(t, dirFS.Lchown(subdir, 1, 2))
 
-	file := path.Join(dir, "a file")
-	err = ioutil.WriteFile(file, []byte("Some data"), 0222|os.ModeSetuid)
+	file := dirFS.Join(dirFS.Path(), "a file")
+	err = contdriver.WriteFile(dirFS, file, []byte("Some data"), 0222|os.ModeSetuid)
 	require.NoError(t, err)
 }
 
 func verifyBase(t testing.TB, driver graphdriver.Driver, name string) {
-	dir, err := driver.Get(name, "")
+	dirFS, err := driver.Get(name, "")
 	require.NoError(t, err)
 	defer driver.Put(name)
 
-	subdir := path.Join(dir, "a subdir")
+	subdir := dirFS.Join(dirFS.Path(), "a subdir")
 	verifyFile(t, subdir, 0705|os.ModeDir|os.ModeSticky, 1, 2)
 
-	file := path.Join(dir, "a file")
+	file := dirFS.Join(dirFS.Path(), "a file")
 	verifyFile(t, file, 0222|os.ModeSetuid, 0, 0)
 
-	files, err := readDir(dir)
+	files, err := readDir(dirFS, dirFS.Path())
 	require.NoError(t, err)
 	assert.Len(t, files, 2)
 }

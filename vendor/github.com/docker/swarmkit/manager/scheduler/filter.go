@@ -128,7 +128,7 @@ func (f *PluginFilter) SetTask(t *api.Task) bool {
 		}
 	}
 
-	if (c != nil && volumeTemplates) || len(t.Networks) > 0 {
+	if (c != nil && volumeTemplates) || len(t.Networks) > 0 || t.Spec.LogDriver != nil {
 		f.t = t
 		return true
 	}
@@ -153,7 +153,7 @@ func (f *PluginFilter) Check(n *NodeInfo) bool {
 	if container != nil {
 		for _, mount := range container.Mounts {
 			if referencesVolumePlugin(mount) {
-				if !f.pluginExistsOnNode("Volume", mount.VolumeOptions.DriverConfig.Name, nodePlugins) {
+				if _, exists := f.pluginExistsOnNode("Volume", mount.VolumeOptions.DriverConfig.Name, nodePlugins); !exists {
 					return false
 				}
 			}
@@ -163,22 +163,37 @@ func (f *PluginFilter) Check(n *NodeInfo) bool {
 	// Check if all network plugins required by task are installed on node
 	for _, tn := range f.t.Networks {
 		if tn.Network != nil && tn.Network.DriverState != nil && tn.Network.DriverState.Name != "" {
-			if !f.pluginExistsOnNode("Network", tn.Network.DriverState.Name, nodePlugins) {
+			if _, exists := f.pluginExistsOnNode("Network", tn.Network.DriverState.Name, nodePlugins); !exists {
 				return false
 			}
+		}
+	}
+
+	// It's possible that the LogDriver object does not carry a name, just some
+	// configuration options. In that case, the plugin filter shouldn't fail to
+	// schedule the task
+	if f.t.Spec.LogDriver != nil && f.t.Spec.LogDriver.Name != "none" && f.t.Spec.LogDriver.Name != "" {
+		// If there are no log driver types in the list at all, most likely this is
+		// an older daemon that did not report this information. In this case don't filter
+		if typeFound, exists := f.pluginExistsOnNode("Log", f.t.Spec.LogDriver.Name, nodePlugins); !exists && typeFound {
+			return false
 		}
 	}
 	return true
 }
 
 // pluginExistsOnNode returns true if the (pluginName, pluginType) pair is present in nodePlugins
-func (f *PluginFilter) pluginExistsOnNode(pluginType string, pluginName string, nodePlugins []api.PluginDescription) bool {
+func (f *PluginFilter) pluginExistsOnNode(pluginType string, pluginName string, nodePlugins []api.PluginDescription) (bool, bool) {
+	var typeFound bool
+
 	for _, np := range nodePlugins {
 		if pluginType != np.Type {
 			continue
 		}
+		typeFound = true
+
 		if pluginName == np.Name {
-			return true
+			return true, true
 		}
 		// This does not use the reference package to avoid the
 		// overhead of parsing references as part of the scheduling
@@ -186,10 +201,10 @@ func (f *PluginFilter) pluginExistsOnNode(pluginType string, pluginName string, 
 		// strict subset of the reference grammar that is always
 		// name:tag.
 		if strings.HasPrefix(np.Name, pluginName) && np.Name[len(pluginName):] == ":latest" {
-			return true
+			return true, true
 		}
 	}
-	return false
+	return typeFound, false
 }
 
 // Explain returns an explanation of a failure.
@@ -280,6 +295,14 @@ func (f *PlatformFilter) platformEqual(imgPlatform, nodePlatform api.Platform) b
 	}
 	if nodePlatform.Architecture == "x86_64" {
 		nodePlatform.Architecture = "amd64"
+	}
+
+	// normalize "aarch64" architectures to "arm64"
+	if imgPlatform.Architecture == "aarch64" {
+		imgPlatform.Architecture = "arm64"
+	}
+	if nodePlatform.Architecture == "aarch64" {
+		nodePlatform.Architecture = "arm64"
 	}
 
 	if (imgPlatform.Architecture == "" || imgPlatform.Architecture == nodePlatform.Architecture) && (imgPlatform.OS == "" || imgPlatform.OS == nodePlatform.OS) {

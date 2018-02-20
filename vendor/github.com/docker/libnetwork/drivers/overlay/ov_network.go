@@ -8,12 +8,12 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"runtime"
 	"strconv"
 	"strings"
 	"sync"
 	"syscall"
 
-	"github.com/Sirupsen/logrus"
 	"github.com/docker/docker/pkg/reexec"
 	"github.com/docker/libnetwork/datastore"
 	"github.com/docker/libnetwork/driverapi"
@@ -23,6 +23,7 @@ import (
 	"github.com/docker/libnetwork/osl"
 	"github.com/docker/libnetwork/resolvconf"
 	"github.com/docker/libnetwork/types"
+	"github.com/sirupsen/logrus"
 	"github.com/vishvananda/netlink"
 	"github.com/vishvananda/netlink/nl"
 	"github.com/vishvananda/netns"
@@ -80,6 +81,10 @@ func setDefaultVlan() {
 		logrus.Error("insufficient number of arguments")
 		os.Exit(1)
 	}
+
+	runtime.LockOSThread()
+	defer runtime.UnlockOSThread()
+
 	nsPath := os.Args[1]
 	ns, err := netns.GetFromPath(nsPath)
 	if err != nil {
@@ -113,7 +118,7 @@ func setDefaultVlan() {
 	data := []byte{'0', '\n'}
 
 	if err = ioutil.WriteFile(path, data, 0644); err != nil {
-		logrus.Errorf("endbling default vlan on bridge %s failed %v", brName, err)
+		logrus.Errorf("enabling default vlan on bridge %s failed %v", brName, err)
 		os.Exit(1)
 	}
 	os.Exit(0)
@@ -245,8 +250,9 @@ func (d *driver) DeleteNetwork(nid string) error {
 		if err := d.deleteEndpointFromStore(ep); err != nil {
 			logrus.Warnf("Failed to delete overlay endpoint %s from local store: %v", ep.id[0:7], err)
 		}
-
 	}
+	// flush the peerDB entries
+	d.peerFlush(nid)
 	d.deleteNetwork(nid)
 
 	vnis, err := n.releaseVxlanID()
@@ -488,7 +494,7 @@ func (n *network) restoreSubnetSandbox(s *subnet, brName, vxlanName string) erro
 	brIfaceOption := make([]osl.IfaceOption, 2)
 	brIfaceOption = append(brIfaceOption, sbox.InterfaceOptions().Address(s.gwIP))
 	brIfaceOption = append(brIfaceOption, sbox.InterfaceOptions().Bridge(true))
-	Ifaces[fmt.Sprintf("%s+%s", brName, "br")] = brIfaceOption
+	Ifaces[brName+"+br"] = brIfaceOption
 
 	err := sbox.Restore(Ifaces, nil, nil, nil)
 	if err != nil {
@@ -498,12 +504,8 @@ func (n *network) restoreSubnetSandbox(s *subnet, brName, vxlanName string) erro
 	Ifaces = make(map[string][]osl.IfaceOption)
 	vxlanIfaceOption := make([]osl.IfaceOption, 1)
 	vxlanIfaceOption = append(vxlanIfaceOption, sbox.InterfaceOptions().Master(brName))
-	Ifaces[fmt.Sprintf("%s+%s", vxlanName, "vxlan")] = vxlanIfaceOption
-	err = sbox.Restore(Ifaces, nil, nil, nil)
-	if err != nil {
-		return err
-	}
-	return nil
+	Ifaces[vxlanName+"+vxlan"] = vxlanIfaceOption
+	return sbox.Restore(Ifaces, nil, nil, nil)
 }
 
 func (n *network) setupSubnetSandbox(s *subnet, brName, vxlanName string) error {
@@ -670,7 +672,7 @@ func (n *network) initSandbox(restore bool) error {
 	// In the restore case network sandbox already exist; but we don't know
 	// what epoch number it was created with. It has to be retrieved by
 	// searching the net namespaces.
-	key := ""
+	var key string
 	if restore {
 		key = osl.GenerateKey("-" + n.id)
 	} else {
@@ -682,20 +684,34 @@ func (n *network) initSandbox(restore bool) error {
 		return fmt.Errorf("could not get network sandbox (oper %t): %v", restore, err)
 	}
 
+	// this is needed to let the peerAdd configure the sandbox
 	n.setSandbox(sbox)
 
 	if !restore {
-		n.driver.peerDbUpdateSandbox(n.id)
+		// Initialize the sandbox with all the peers previously received from networkdb
+		n.driver.initSandboxPeerDB(n.id)
+	}
+
+	// If we are in swarm mode, we don't need anymore the watchMiss routine.
+	// This will save 1 thread and 1 netlink socket per network
+	if !n.driver.isSerfAlive() {
+		return nil
 	}
 
 	var nlSock *nl.NetlinkSocket
 	sbox.InvokeFunc(func() {
 		nlSock, err = nl.Subscribe(syscall.NETLINK_ROUTE, syscall.RTNLGRP_NEIGH)
+		if err != nil {
+			return
+		}
+		// set the receive timeout to not remain stuck on the RecvFrom if the fd gets closed
+		tv := syscall.NsecToTimeval(soTimeout.Nanoseconds())
+		err = nlSock.SetReceiveTimeout(&tv)
 	})
 	n.setNetlinkSocket(nlSock)
 
 	if err == nil {
-		go n.watchMiss(nlSock)
+		go n.watchMiss(nlSock, key)
 	} else {
 		logrus.Errorf("failed to subscribe to neighbor group netlink messages for overlay network %s in sbox %s: %v",
 			n.id, sbox.Key(), err)
@@ -704,7 +720,23 @@ func (n *network) initSandbox(restore bool) error {
 	return nil
 }
 
-func (n *network) watchMiss(nlSock *nl.NetlinkSocket) {
+func (n *network) watchMiss(nlSock *nl.NetlinkSocket, nsPath string) {
+	// With the new version of the netlink library the deserialize function makes
+	// requests about the interface of the netlink message. This can succeed only
+	// if this go routine is in the target namespace. For this reason following we
+	// lock the thread on that namespace
+	runtime.LockOSThread()
+	defer runtime.UnlockOSThread()
+	newNs, err := netns.GetFromPath(nsPath)
+	if err != nil {
+		logrus.WithError(err).Errorf("failed to get the namespace %s", nsPath)
+		return
+	}
+	defer newNs.Close()
+	if err = netns.Set(newNs); err != nil {
+		logrus.WithError(err).Errorf("failed to enter the namespace %s", nsPath)
+		return
+	}
 	for {
 		msgs, err := nlSock.Receive()
 		if err != nil {
@@ -714,6 +746,11 @@ func (n *network) watchMiss(nlSock *nl.NetlinkSocket) {
 			if nlFd == -1 {
 				// The netlink socket got closed, simply exit to not leak this goroutine
 				return
+			}
+			// When the receive timeout expires the receive will return EAGAIN
+			if err == syscall.EAGAIN {
+				// we continue here to avoid spam for timeouts
+				continue
 			}
 			logrus.Errorf("Failed to receive from netlink: %v ", err)
 			continue
@@ -751,25 +788,17 @@ func (n *network) watchMiss(nlSock *nl.NetlinkSocket) {
 				continue
 			}
 
-			logrus.Debugf("miss notification: dest IP %v, dest MAC %v", ip, mac)
-
 			if neigh.State&(netlink.NUD_STALE|netlink.NUD_INCOMPLETE) == 0 {
 				continue
 			}
 
-			if !n.driver.isSerfAlive() {
-				continue
-			}
-
+			logrus.Debugf("miss notification: dest IP %v, dest MAC %v", ip, mac)
 			mac, IPmask, vtep, err := n.driver.resolvePeer(n.id, ip)
 			if err != nil {
 				logrus.Errorf("could not resolve peer %q: %v", ip, err)
 				continue
 			}
-
-			if err := n.driver.peerAdd(n.id, "dummy", ip, IPmask, mac, vtep, true, l2Miss, l3Miss); err != nil {
-				logrus.Errorf("could not add neighbor entry for missed peer %q: %v", ip, err)
-			}
+			n.driver.peerAdd(n.id, "dummy", ip, IPmask, mac, vtep, l2Miss, l3Miss, false)
 		}
 	}
 }
@@ -872,15 +901,10 @@ func (n *network) Value() []byte {
 		netJSON = append(netJSON, sj)
 	}
 
-	b, err := json.Marshal(netJSON)
-	if err != nil {
-		return []byte{}
-	}
-
 	m["secure"] = n.secure
 	m["subnets"] = netJSON
 	m["mtu"] = n.mtu
-	b, err = json.Marshal(m)
+	b, err := json.Marshal(m)
 	if err != nil {
 		return []byte{}
 	}
@@ -1025,7 +1049,7 @@ func (n *network) obtainVxlanID(s *subnet) error {
 		}
 
 		if s.vni == 0 {
-			vxlanID, err := n.driver.vxlanIdm.GetID()
+			vxlanID, err := n.driver.vxlanIdm.GetID(true)
 			if err != nil {
 				return fmt.Errorf("failed to allocate vxlan id: %v", err)
 			}

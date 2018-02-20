@@ -1,6 +1,6 @@
 // +build !windows
 
-package daemon
+package daemon // import "github.com/docker/docker/daemon"
 
 import (
 	"encoding/json"
@@ -206,7 +206,7 @@ func TestBackportMountSpec(t *testing.T) {
 					BindOptions: &mounttypes.BindOptions{Propagation: "shared"},
 				},
 			},
-			comment: "bind mount with read/write + shared propgation",
+			comment: "bind mount with read/write + shared propagation",
 		},
 		{
 			mp: &volume.MountPoint{

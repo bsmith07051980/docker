@@ -1,8 +1,9 @@
-package archive
+package archive // import "github.com/docker/docker/pkg/archive"
 
 import (
 	"archive/tar"
 	"bytes"
+	"compress/gzip"
 	"fmt"
 	"io"
 	"io/ioutil"
@@ -14,6 +15,8 @@ import (
 	"testing"
 	"time"
 
+	"github.com/docker/docker/pkg/idtools"
+	"github.com/docker/docker/pkg/ioutils"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 )
@@ -71,12 +74,7 @@ func TestIsArchivePathInvalidFile(t *testing.T) {
 }
 
 func TestIsArchivePathTar(t *testing.T) {
-	var whichTar string
-	if runtime.GOOS == "solaris" {
-		whichTar = "gtar"
-	} else {
-		whichTar = "tar"
-	}
+	whichTar := "tar"
 	cmdStr := fmt.Sprintf("touch /tmp/archivedata && %s -cf /tmp/archive /tmp/archivedata && gzip --stdout /tmp/archive > /tmp/archive.gz", whichTar)
 	cmd := exec.Command("sh", "-c", cmdStr)
 	output, err := cmd.CombinedOutput()
@@ -91,7 +89,7 @@ func TestIsArchivePathTar(t *testing.T) {
 	}
 }
 
-func testDecompressStream(t *testing.T, ext, compressCommand string) {
+func testDecompressStream(t *testing.T, ext, compressCommand string) io.Reader {
 	cmd := exec.Command("sh", "-c",
 		fmt.Sprintf("touch /tmp/archive && %s /tmp/archive", compressCommand))
 	output, err := cmd.CombinedOutput()
@@ -115,6 +113,8 @@ func testDecompressStream(t *testing.T, ext, compressCommand string) {
 	if err = r.Close(); err != nil {
 		t.Fatalf("Failed to close the decompressed stream: %v ", err)
 	}
+
+	return r
 }
 
 func TestDecompressStreamGzip(t *testing.T) {
@@ -210,7 +210,7 @@ func TestExtensionXz(t *testing.T) {
 
 func TestCmdStreamLargeStderr(t *testing.T) {
 	cmd := exec.Command("sh", "-c", "dd if=/dev/zero bs=1k count=1000 of=/dev/stderr; echo hello")
-	out, _, err := cmdStream(cmd, nil)
+	out, err := cmdStream(cmd, nil)
 	if err != nil {
 		t.Fatalf("Failed to start command: %s", err)
 	}
@@ -235,7 +235,7 @@ func TestCmdStreamBad(t *testing.T) {
 		t.Skip("Failing on Windows CI machines")
 	}
 	badCmd := exec.Command("sh", "-c", "echo hello; echo >&2 error couldn\\'t reverse the phase pulser; exit 1")
-	out, _, err := cmdStream(badCmd, nil)
+	out, err := cmdStream(badCmd, nil)
 	if err != nil {
 		t.Fatalf("Failed to start command: %s", err)
 	}
@@ -250,7 +250,7 @@ func TestCmdStreamBad(t *testing.T) {
 
 func TestCmdStreamGood(t *testing.T) {
 	cmd := exec.Command("sh", "-c", "echo hello; exit 0")
-	out, _, err := cmdStream(cmd, nil)
+	out, err := cmdStream(cmd, nil)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -263,9 +263,7 @@ func TestCmdStreamGood(t *testing.T) {
 
 func TestUntarPathWithInvalidDest(t *testing.T) {
 	tempFolder, err := ioutil.TempDir("", "docker-archive-test")
-	if err != nil {
-		t.Fatal(err)
-	}
+	require.NoError(t, err)
 	defer os.RemoveAll(tempFolder)
 	invalidDestFolder := filepath.Join(tempFolder, "invalidDest")
 	// Create a src file
@@ -284,9 +282,7 @@ func TestUntarPathWithInvalidDest(t *testing.T) {
 
 	cmd := exec.Command("sh", "-c", "tar cf "+tarFileU+" "+srcFileU)
 	_, err = cmd.CombinedOutput()
-	if err != nil {
-		t.Fatal(err)
-	}
+	require.NoError(t, err)
 
 	err = defaultUntarPath(tarFile, invalidDestFolder)
 	if err == nil {
@@ -308,9 +304,7 @@ func TestUntarPathWithInvalidSrc(t *testing.T) {
 
 func TestUntarPath(t *testing.T) {
 	tmpFolder, err := ioutil.TempDir("", "docker-archive-test")
-	if err != nil {
-		t.Fatal(err)
-	}
+	require.NoError(t, err)
 	defer os.RemoveAll(tmpFolder)
 	srcFile := filepath.Join(tmpFolder, "src")
 	tarFile := filepath.Join(tmpFolder, "src.tar")
@@ -331,9 +325,7 @@ func TestUntarPath(t *testing.T) {
 	}
 	cmd := exec.Command("sh", "-c", "tar cf "+tarFileU+" "+srcFileU)
 	_, err = cmd.CombinedOutput()
-	if err != nil {
-		t.Fatal(err)
-	}
+	require.NoError(t, err)
 
 	err = defaultUntarPath(tarFile, destFolder)
 	if err != nil {
@@ -728,6 +720,57 @@ func TestTarUntar(t *testing.T) {
 
 		if len(changes) != 1 || changes[0].Path != "/3" {
 			t.Fatalf("Unexpected differences after tarUntar: %v", changes)
+		}
+	}
+}
+
+func TestTarWithOptionsChownOptsAlwaysOverridesIdPair(t *testing.T) {
+	origin, err := ioutil.TempDir("", "docker-test-tar-chown-opt")
+	require.NoError(t, err)
+
+	defer os.RemoveAll(origin)
+	filePath := filepath.Join(origin, "1")
+	err = ioutil.WriteFile(filePath, []byte("hello world"), 0700)
+	require.NoError(t, err)
+
+	idMaps := []idtools.IDMap{
+		0: {
+			ContainerID: 0,
+			HostID:      0,
+			Size:        65536,
+		},
+		1: {
+			ContainerID: 0,
+			HostID:      100000,
+			Size:        65536,
+		},
+	}
+
+	cases := []struct {
+		opts        *TarOptions
+		expectedUID int
+		expectedGID int
+	}{
+		{&TarOptions{ChownOpts: &idtools.IDPair{UID: 1337, GID: 42}}, 1337, 42},
+		{&TarOptions{ChownOpts: &idtools.IDPair{UID: 100001, GID: 100001}, UIDMaps: idMaps, GIDMaps: idMaps}, 100001, 100001},
+		{&TarOptions{ChownOpts: &idtools.IDPair{UID: 0, GID: 0}, NoLchown: false}, 0, 0},
+		{&TarOptions{ChownOpts: &idtools.IDPair{UID: 1, GID: 1}, NoLchown: true}, 1, 1},
+		{&TarOptions{ChownOpts: &idtools.IDPair{UID: 1000, GID: 1000}, NoLchown: true}, 1000, 1000},
+	}
+	for _, testCase := range cases {
+		reader, err := TarWithOptions(filePath, testCase.opts)
+		require.NoError(t, err)
+		tr := tar.NewReader(reader)
+		defer reader.Close()
+		for {
+			hdr, err := tr.Next()
+			if err == io.EOF {
+				// end of tar archive
+				break
+			}
+			require.NoError(t, err)
+			assert.Equal(t, hdr.Uid, testCase.expectedUID, "Uid equals expected value")
+			assert.Equal(t, hdr.Gid, testCase.expectedGID, "Gid equals expected value")
 		}
 	}
 }
@@ -1139,8 +1182,10 @@ func TestUntarInvalidSymlink(t *testing.T) {
 func TestTempArchiveCloseMultipleTimes(t *testing.T) {
 	reader := ioutil.NopCloser(strings.NewReader("hello"))
 	tempArchive, err := NewTempArchive(reader, "")
+	require.NoError(t, err)
 	buf := make([]byte, 10)
 	n, err := tempArchive.Read(buf)
+	require.NoError(t, err)
 	if n != 5 {
 		t.Fatalf("Expected to read 5 bytes. Read %d instead", n)
 	}
@@ -1203,6 +1248,25 @@ func TestReplaceFileTarWrapper(t *testing.T) {
 	}
 }
 
+// TestPrefixHeaderReadable tests that files that could be created with the
+// version of this package that was built with <=go17 are still readable.
+func TestPrefixHeaderReadable(t *testing.T) {
+	// https://gist.github.com/stevvooe/e2a790ad4e97425896206c0816e1a882#file-out-go
+	var testFile = []byte("\x1f\x8b\x08\x08\x44\x21\x68\x59\x00\x03\x74\x2e\x74\x61\x72\x00\x4b\xcb\xcf\x67\xa0\x35\x30\x80\x00\x86\x06\x10\x47\x01\xc1\x37\x40\x00\x54\xb6\xb1\xa1\xa9\x99\x09\x48\x25\x1d\x40\x69\x71\x49\x62\x91\x02\xe5\x76\xa1\x79\x84\x21\x91\xd6\x80\x72\xaf\x8f\x82\x51\x30\x0a\x46\x36\x00\x00\xf0\x1c\x1e\x95\x00\x06\x00\x00")
+
+	tmpDir, err := ioutil.TempDir("", "prefix-test")
+	require.NoError(t, err)
+	defer os.RemoveAll(tmpDir)
+	err = Untar(bytes.NewReader(testFile), tmpDir, nil)
+	require.NoError(t, err)
+
+	baseName := "foo"
+	pth := strings.Repeat("a", 100-len(baseName)) + "/" + baseName
+
+	_, err = os.Lstat(filepath.Join(tmpDir, pth))
+	require.NoError(t, err)
+}
+
 func buildSourceArchive(t *testing.T, numberOfFiles int) (io.ReadCloser, func()) {
 	srcDir, err := ioutil.TempDir("", "docker-test-srcDir")
 	require.NoError(t, err)
@@ -1257,4 +1321,39 @@ func readFileFromArchive(t *testing.T, archive io.ReadCloser, name string, expec
 	content, err := ioutil.ReadFile(filepath.Join(destDir, name))
 	assert.NoError(t, err)
 	return string(content)
+}
+
+func TestDisablePigz(t *testing.T) {
+	_, err := exec.LookPath("unpigz")
+	if err != nil {
+		t.Log("Test will not check full path when Pigz not installed")
+	}
+
+	os.Setenv("MOBY_DISABLE_PIGZ", "true")
+	defer os.Unsetenv("MOBY_DISABLE_PIGZ")
+
+	r := testDecompressStream(t, "gz", "gzip -f")
+	// For the bufio pool
+	outsideReaderCloserWrapper := r.(*ioutils.ReadCloserWrapper)
+	// For the context canceller
+	contextReaderCloserWrapper := outsideReaderCloserWrapper.Reader.(*ioutils.ReadCloserWrapper)
+
+	assert.IsType(t, &gzip.Reader{}, contextReaderCloserWrapper.Reader)
+}
+
+func TestPigz(t *testing.T) {
+	r := testDecompressStream(t, "gz", "gzip -f")
+	// For the bufio pool
+	outsideReaderCloserWrapper := r.(*ioutils.ReadCloserWrapper)
+	// For the context canceller
+	contextReaderCloserWrapper := outsideReaderCloserWrapper.Reader.(*ioutils.ReadCloserWrapper)
+
+	_, err := exec.LookPath("unpigz")
+	if err == nil {
+		t.Log("Tested whether Pigz is used, as it installed")
+		assert.IsType(t, &io.PipeReader{}, contextReaderCloserWrapper.Reader)
+	} else {
+		t.Log("Tested whether Pigz is not used, as it not installed")
+		assert.IsType(t, &gzip.Reader{}, contextReaderCloserWrapper.Reader)
+	}
 }
